@@ -1,0 +1,1189 @@
+#requires -Modules LAPS
+#requires -Version 5.1
+
+[CmdletBinding()]
+param()
+
+# ==================== CONFIGURATION ====================
+$ListenIP   = "10.209.110.220"
+$Port       = 8080
+$ServerUrl  = "http://" + $ListenIP + ":" + $Port + "/"
+
+# ==================== VALIDATION ====================
+Write-Host "Checking LAPS Module..." -ForegroundColor Cyan
+try {
+    Import-Module LAPS -Force -ErrorAction Stop
+    $lapsCmd = Get-Command Get-LapsADPassword -ErrorAction Stop
+    Write-Host "[OK] LAPS module loaded: $($lapsCmd.ModuleName)" -ForegroundColor Green
+} catch {
+    Write-Host "[FAIL] LAPS module not found." -ForegroundColor Red
+    exit 1
+}
+
+# ==================== C# WEB SERVER ====================
+Write-Host "Compiling C# Web Server..." -ForegroundColor Cyan
+
+$CSharpCode = @'
+using System;
+using System.Net;
+using System.Text;
+using System.IO;
+using System.Collections;
+using System.Collections.Generic;
+using System.Threading;
+using System.Diagnostics;
+using System.Web;
+using System.Web.Script.Serialization;
+using System.Security.Cryptography;
+
+public class SessionData
+{
+    public string User { get; set; }
+    public bool IsAdmin { get; set; }
+    public DateTime LoginTime { get; set; }
+}
+
+public class LapsWebServer
+{
+    private HttpListener listener;
+    private readonly string ip;
+    private readonly int port;
+    private volatile bool running = true;
+    private readonly Dictionary<string, SessionData> sessions = new Dictionary<string, SessionData>();
+    private Dictionary<string, object> authorizedUsers = new Dictionary<string, object>();
+
+    // Logging & Storage Paths
+    private static readonly string BaseDir = @"D:\LAPS_WEB_PORTAL";
+    private static readonly string LogDir = @"D:\LAPS_WEB_PORTAL\Logs";
+    private static readonly string LogFile = @"D:\LAPS_WEB_PORTAL\Logs\laps_portal.log";
+    private static readonly string UsersFile = @"D:\LAPS_WEB_PORTAL\users.json";
+    private static readonly object fileLock = new object();
+
+    public LapsWebServer(string serverIp, int serverPort)
+    {
+        ip = serverIp;
+        port = serverPort;
+        authorizedUsers = new Dictionary<string, object>();
+        
+        EnsureDirectories();
+        LoadUsers();
+
+        if (!authorizedUsers.ContainsKey("ADMIN"))
+        {
+            authorizedUsers["ADMIN"] = new { authorized = true, addedBy = "SYSTEM", addedDate = DateTime.Now };
+            SaveUsers();
+        }
+
+        LogEvent("Server instance initialized on " + serverIp + ":" + serverPort);
+    }
+
+    private void EnsureDirectories()
+    {
+        try
+        {
+            if (!Directory.Exists(BaseDir)) Directory.CreateDirectory(BaseDir);
+            if (!Directory.Exists(LogDir)) Directory.CreateDirectory(LogDir);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("[FATAL] Could not create directories: " + ex.Message);
+        }
+    }
+
+    private void LogEvent(string message)
+    {
+        try
+        {
+            lock (fileLock)
+            {
+                string logLine = "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "] " + message + Environment.NewLine;
+                File.AppendAllText(LogFile, logLine);
+            }
+        }
+        catch { /* Fallback silently so server doesn't crash if log is locked */ }
+    }
+
+    private void LoadUsers()
+    {
+        try
+        {
+            if (File.Exists(UsersFile))
+            {
+                string json = File.ReadAllText(UsersFile);
+                JavaScriptSerializer serializer = new JavaScriptSerializer();
+                var loaded = serializer.Deserialize<Dictionary<string, object>>(json);
+                if (loaded != null)
+                {
+                    lock (authorizedUsers)
+                    {
+                        authorizedUsers = loaded;
+                    }
+                }
+                LogEvent("Users loaded successfully from " + UsersFile);
+            }
+        }
+        catch (Exception ex)
+        {
+            LogEvent("ERROR loading users: " + ex.Message);
+        }
+    }
+
+    private void SaveUsers()
+    {
+        try
+        {
+            JavaScriptSerializer serializer = new JavaScriptSerializer();
+            string json;
+            lock (authorizedUsers)
+            {
+                json = serializer.Serialize(authorizedUsers);
+            }
+            lock (fileLock)
+            {
+                File.WriteAllText(UsersFile, json);
+            }
+            LogEvent("Authorized users saved to " + UsersFile);
+        }
+        catch (Exception ex)
+        {
+            LogEvent("ERROR saving users: " + ex.Message);
+        }
+    }
+
+    public void SetAuthorizedUsers(Hashtable hashtable)
+    {
+        if (hashtable == null) return;
+        
+        lock (authorizedUsers)
+        {
+            authorizedUsers.Clear();
+            foreach (DictionaryEntry entry in hashtable)
+            {
+                authorizedUsers[(string)entry.Key] = entry.Value;
+            }
+        }
+        SaveUsers();
+    }
+
+    public void Start()
+    {
+        listener = new HttpListener();
+        string prefix = "http://" + ip + ":" + port.ToString() + "/";
+        listener.Prefixes.Add(prefix);
+        
+        try
+        {
+            listener.Start();
+            Console.WriteLine("[SERVER] Listening on " + prefix);
+            LogEvent("SERVER STARTED. Listening on " + prefix);
+        }
+        catch (HttpListenerException ex)
+        {
+            Console.WriteLine("[FATAL] Cannot bind to " + ip + ":" + port.ToString());
+            Console.WriteLine("        Error: " + ex.Message);
+            LogEvent("FATAL ERROR: Cannot bind to port. " + ex.Message);
+            throw;
+        }
+
+        while (running)
+        {
+            try
+            {
+                HttpListenerContext context = listener.GetContext();
+                ThreadPool.QueueUserWorkItem(new WaitCallback(ProcessRequestCallback), context);
+            }
+            catch (HttpListenerException) { }
+            catch (ObjectDisposedException) { }
+        }
+    }
+
+    public void Stop()
+    {
+        running = false;
+        if (listener != null)
+        {
+            listener.Stop();
+            listener.Close();
+            LogEvent("SERVER STOPPED.");
+        }
+    }
+
+    private void ProcessRequestCallback(object state)
+    {
+        HttpListenerContext context = (HttpListenerContext)state;
+        ProcessRequest(context);
+    }
+
+    private void ProcessRequest(HttpListenerContext context)
+    {
+        HttpListenerRequest req = context.Request;
+        HttpListenerResponse res = context.Response;
+
+        try
+        {
+            string path = req.Url.AbsolutePath.ToLower();
+            string method = req.HttpMethod;
+            string sessionId = GetSessionCookie(req);
+            string clientIp = req.RemoteEndPoint != null ? req.RemoteEndPoint.ToString() : "Unknown IP";
+
+            LogEvent("Request: " + method + " " + path + " from " + clientIp);
+
+            if (method == "GET" && (path == "/" || path == "/index.html"))
+            {
+                if (string.IsNullOrEmpty(sessionId) || !IsSessionValid(sessionId))
+                {
+                    SendHtml(res, BuildLoginPage(null), null);
+                }
+                else
+                {
+                    SendHtml(res, BuildMainPage(null, null, null, GetSessionUser(sessionId), IsSessionAdmin(sessionId)), sessionId);
+                }
+            }
+            else if (method == "POST" && path == "/login")
+            {
+                HandleLogin(req, res);
+            }
+            else if (method == "GET" && path == "/logout-page")
+            {
+                string user = GetSessionUser(sessionId);
+                ClearSessionCookie(res);
+                LogEvent("User logged out: " + (string.IsNullOrEmpty(user) ? "Unknown" : user));
+                SendHtml(res, BuildLoginPage("Logged out successfully"), null);
+            }
+            else if (method == "POST" && path == "/get-laps")
+            {
+                if (!IsSessionValid(sessionId))
+                {
+                    LogEvent("Unauthorized LAPS query attempt from " + clientIp);
+                    res.StatusCode = 401;
+                    SendJson(res, new { error = "Unauthorized" });
+                    return;
+                }
+                HandleLapsQuery(req, res, sessionId);
+            }
+            else if (method == "GET" && path == "/admin")
+            {
+                if (!IsSessionValid(sessionId) || !IsSessionAdmin(sessionId))
+                {
+                    LogEvent("Unauthorized admin page access attempt from " + clientIp);
+                    res.StatusCode = 403;
+                    SendHtml(res, BuildLoginPage("Access denied"), null);
+                    return;
+                }
+                SendHtml(res, BuildAdminPage(null, GetSessionUser(sessionId)), sessionId);
+            }
+            else if (method == "POST" && path == "/admin/add-user")
+            {
+                if (!IsSessionValid(sessionId) || !IsSessionAdmin(sessionId))
+                {
+                    res.StatusCode = 403;
+                    SendJson(res, new { error = "Unauthorized" });
+                    return;
+                }
+                HandleAddUser(req, res, sessionId);
+            }
+            else if (method == "POST" && path == "/admin/remove-user")
+            {
+                if (!IsSessionValid(sessionId) || !IsSessionAdmin(sessionId))
+                {
+                    res.StatusCode = 403;
+                    SendJson(res, new { error = "Unauthorized" });
+                    return;
+                }
+                HandleRemoveUser(req, res, sessionId);
+            }
+            else if (method == "GET" && path == "/admin/get-users")
+            {
+                if (!IsSessionValid(sessionId) || !IsSessionAdmin(sessionId))
+                {
+                    res.StatusCode = 403;
+                    SendJson(res, new { error = "Unauthorized" });
+                    return;
+                }
+                HandleGetUsers(res);
+            }
+            else
+            {
+                LogEvent("404 Not Found: " + path + " from " + clientIp);
+                res.StatusCode = 404;
+                SendHtml(res, "<h1>404 Not Found</h1>", null);
+            }
+        }
+        catch (Exception ex)
+        {
+            LogEvent("SERVER EXCEPTION: " + ex.ToString());
+            res.StatusCode = 500;
+            SendHtml(res, "<h1>Server Error</h1><pre>" + SafeHtmlEncode(ex.ToString()) + "</pre>", null);
+        }
+        finally
+        {
+            res.Close();
+        }
+    }
+
+    private void HandleLogin(HttpListenerRequest req, HttpListenerResponse res)
+    {
+        string username = "";
+        string password = "";
+        string clientIp = req.RemoteEndPoint != null ? req.RemoteEndPoint.ToString() : "Unknown IP";
+
+        using (StreamReader reader = new StreamReader(req.InputStream, req.ContentEncoding))
+        {
+            string body = reader.ReadToEnd();
+            Dictionary<string, string> formData = ParseFormData(body);
+            if (formData.ContainsKey("username")) username = formData["username"];
+            if (formData.ContainsKey("password")) password = formData["password"];
+        }
+
+        username = (username ?? "").Trim();
+        password = (password ?? "").Trim();
+
+        bool authSuccess = false;
+        bool isAdmin = false;
+
+        // Check if admin credentials
+        if (username == "ADMIN" && password == "ADMIN123")
+        {
+            authSuccess = true;
+            isAdmin = true;
+        }
+        // Check if domain user (authorized)
+        else if (!string.IsNullOrEmpty(username) && !string.IsNullOrEmpty(password))
+        {
+            if (IsUserAuthorized(username))
+            {
+                if (AuthenticateWithDomain(username, password))
+                {
+                    authSuccess = true;
+                    isAdmin = false;
+                }
+                else
+                {
+                    LogEvent("Login failed for user: " + username + " from " + clientIp + " (Invalid domain credentials)");
+                    SendHtml(res, BuildLoginPage("Invalid credentials"), null);
+                    return;
+                }
+            }
+            else
+            {
+                LogEvent("Login failed for user: " + username + " from " + clientIp + " (User not authorized)");
+                SendHtml(res, BuildLoginPage("Invalid credentials"), null);
+                return;
+            }
+        }
+
+        if (!authSuccess)
+        {
+            LogEvent("Login failed for user: " + username + " from " + clientIp + " (Invalid credentials)");
+            SendHtml(res, BuildLoginPage("Invalid credentials"), null);
+            return;
+        }
+
+        LogEvent("Login SUCCESS for user: " + username + " from " + clientIp + " (Admin: " + isAdmin + ")");
+        string sessionId = CreateSession(username, isAdmin);
+        SendHtml(res, BuildMainPage(null, null, null, username, isAdmin), sessionId);
+    }
+
+    private void HandleAddUser(HttpListenerRequest req, HttpListenerResponse res, string sessionId)
+    {
+        string newUsername = "";
+        using (StreamReader reader = new StreamReader(req.InputStream, req.ContentEncoding))
+        {
+            string body = reader.ReadToEnd();
+            Dictionary<string, string> formData = ParseFormData(body);
+            if (formData.ContainsKey("new_username")) newUsername = formData["new_username"];
+        }
+
+        newUsername = (newUsername ?? "").Trim().ToUpper();
+        string adminUser = GetSessionUser(sessionId);
+
+        if (string.IsNullOrEmpty(newUsername))
+        {
+            SendJson(res, new { success = false, message = "Username required" });
+            return;
+        }
+
+        if (newUsername.Length > 20 || !System.Text.RegularExpressions.Regex.IsMatch(newUsername, "^[a-zA-Z0-9\\-\\.]+$"))
+        {
+            LogEvent("Admin " + adminUser + " failed to add user: Invalid format (" + newUsername + ")");
+            SendJson(res, new { success = false, message = "Invalid username format" });
+            return;
+        }
+
+        lock (authorizedUsers)
+        {
+            if (authorizedUsers.ContainsKey(newUsername))
+            {
+                LogEvent("Admin " + adminUser + " failed to add user: Already exists (" + newUsername + ")");
+                SendJson(res, new { success = false, message = "User already authorized" });
+                return;
+            }
+
+            authorizedUsers[newUsername] = new { authorized = true, addedBy = adminUser, addedDate = DateTime.Now };
+        }
+        
+        LogEvent("Admin " + adminUser + " successfully added user: " + newUsername);
+        SaveUsers();
+        SendJson(res, new { success = true, message = "User " + newUsername + " added successfully" });
+    }
+
+    private void HandleRemoveUser(HttpListenerRequest req, HttpListenerResponse res, string sessionId)
+    {
+        string username = "";
+        using (StreamReader reader = new StreamReader(req.InputStream, req.ContentEncoding))
+        {
+            string body = reader.ReadToEnd();
+            Dictionary<string, string> formData = ParseFormData(body);
+            if (formData.ContainsKey("username")) username = formData["username"];
+        }
+
+        username = (username ?? "").Trim().ToUpper();
+        string adminUser = GetSessionUser(sessionId);
+
+        if (username == "ADMIN")
+        {
+            LogEvent("Admin " + adminUser + " attempted to remove ADMIN user. Denied.");
+            SendJson(res, new { success = false, message = "Cannot remove ADMIN user" });
+            return;
+        }
+
+        lock (authorizedUsers)
+        {
+            if (authorizedUsers.ContainsKey(username))
+            {
+                authorizedUsers.Remove(username);
+                LogEvent("Admin " + adminUser + " successfully removed user: " + username);
+                SaveUsers();
+                SendJson(res, new { success = true, message = "User " + username + " removed successfully" });
+            }
+            else
+            {
+                LogEvent("Admin " + adminUser + " failed to remove user: Not found (" + username + ")");
+                SendJson(res, new { success = false, message = "User not found" });
+            }
+        }
+    }
+
+    private void HandleGetUsers(HttpListenerResponse res)
+    {
+        List<object> users = new List<object>();
+        lock (authorizedUsers)
+        {
+            foreach (var kvp in authorizedUsers)
+            {
+                users.Add(new { username = kvp.Key });
+            }
+        }
+        SendJson(res, new { users = users });
+    }
+
+    private void HandleLapsQuery(HttpListenerRequest req, HttpListenerResponse res, string sessionId)
+    {
+        string hostname = "";
+        using (StreamReader reader = new StreamReader(req.InputStream, req.ContentEncoding))
+        {
+            string body = reader.ReadToEnd();
+            Dictionary<string, string> formData = ParseFormData(body);
+            if (formData.ContainsKey("hostname"))
+            {
+                hostname = formData["hostname"];
+            }
+        }
+
+        hostname = (hostname ?? "").Trim();
+        string user = GetSessionUser(sessionId);
+
+        LogEvent("User " + user + " is querying LAPS password for hostname: " + hostname);
+
+        if (string.IsNullOrEmpty(hostname))
+        {
+            LogEvent("LAPS query failed: Hostname empty by " + user);
+            SendHtml(res, BuildMainPage("Hostname is required", "error", null, user, IsSessionAdmin(sessionId)), sessionId);
+            return;
+        }
+
+        if (hostname.Length > 63 || !System.Text.RegularExpressions.Regex.IsMatch(hostname, "^[a-zA-Z0-9\\-\\.]+$"))
+        {
+            LogEvent("LAPS query failed: Invalid format by " + user + " (" + hostname + ")");
+            SendHtml(res, BuildMainPage("Invalid hostname format", "error", null, user, IsSessionAdmin(sessionId)), sessionId);
+            return;
+        }
+
+        string escapedHost = hostname.Replace("'", "''");
+        
+        string psCommand = "-NoProfile -NonInteractive -Command \"Import-Module LAPS; try { $r = Get-LapsADPassword -Identity '" 
+            + escapedHost 
+            + "' -AsPlainText -ErrorAction Stop; [PSCustomObject]@{ ComputerName = $r.ComputerName; Password = $r.Password; ExpirationTimestamp = $r.ExpirationTimestamp } | ConvertTo-Json -Compress } catch { @{ Error = $_.Exception.Message; Type = $_.Exception.GetType().Name } | ConvertTo-Json -Compress }\"";
+
+        ProcessStartInfo psi = new ProcessStartInfo
+        {
+            FileName = "powershell.exe",
+            Arguments = psCommand,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.System)
+        };
+
+        string output = "";
+        string error = "";
+        int exitCode = 0;
+
+        using (Process proc = new Process { StartInfo = psi })
+        {
+            proc.Start();
+            output = proc.StandardOutput.ReadToEnd();
+            error = proc.StandardError.ReadToEnd();
+            proc.WaitForExit(30000);
+            exitCode = proc.ExitCode;
+            
+            if (!proc.HasExited)
+            {
+                try { proc.Kill(); } catch { }
+                LogEvent("LAPS query timeout for hostname " + hostname + " by user " + user);
+                SendHtml(res, BuildMainPage("Query timed out (30s). Check AD connectivity.", "error", hostname, user, IsSessionAdmin(sessionId)), sessionId);
+                return;
+            }
+        }
+
+        if (exitCode != 0 && !string.IsNullOrEmpty(error))
+        {
+            string friendlyError = "LAPS query failed";
+            if (error.Contains("NotFound") || error.Contains("Cannot find"))
+                friendlyError = "Computer not found or LAPS not configured";
+            else if (error.Contains("permission") || error.Contains("access"))
+                friendlyError = "Permission denied. Verify your AD/LAPS permissions.";
+            else
+                friendlyError = "Error: " + error.Trim();
+
+            LogEvent("LAPS query PowerShell Error for hostname " + hostname + ": " + friendlyError);
+            SendHtml(res, BuildMainPage(friendlyError, "error", hostname, user, IsSessionAdmin(sessionId)), sessionId);
+            return;
+        }
+
+        Dictionary<string, string> dict = ParseSimpleJson(output);
+
+        if (dict.ContainsKey("Error"))
+        {
+            string errorMsg = dict["Error"];
+            if (errorMsg.Contains("NotFound") || errorMsg.Contains("Cannot find"))
+                errorMsg = "Computer not found or LAPS not configured";
+                
+            LogEvent("LAPS query Exception for hostname " + hostname + ": " + errorMsg);
+            SendHtml(res, BuildMainPage(errorMsg, "error", hostname, user, IsSessionAdmin(sessionId)), sessionId);
+            return;
+        }
+
+        string password = null;
+        string expiry = null;
+        string computerName = null;
+
+        dict.TryGetValue("ComputerName", out computerName);
+        dict.TryGetValue("Password", out password);
+        dict.TryGetValue("ExpirationTimestamp", out expiry);
+
+        if (string.IsNullOrEmpty(password))
+        {
+            LogEvent("LAPS query failed: No password retrieved for " + hostname);
+            SendHtml(res, BuildMainPage("No LAPS password retrieved. Verify LAPS deployment.", "error", hostname, user, IsSessionAdmin(sessionId)), sessionId);
+            return;
+        }
+
+        LogEvent("LAPS query SUCCESS for hostname " + (computerName ?? hostname) + " by user " + user);
+        
+        string expiryDisplay = "N/A";
+        if (!string.IsNullOrEmpty(expiry))
+        {
+            DateTime dt;
+            if (DateTime.TryParse(expiry, out dt))
+            {
+                double daysRemaining = (dt - DateTime.Now).TotalDays;
+                string colorClass = "expiry-ok";
+                if (daysRemaining < 1) colorClass = "expiry-critical";
+                else if (daysRemaining < 7) colorClass = "expiry-warning";
+                
+                expiryDisplay = "<span class='" + colorClass + "'>" + dt.ToString("yyyy-MM-dd HH:mm") + " (" + daysRemaining.ToString("F1") + " days)</span>";
+            }
+            else
+            {
+                expiryDisplay = SafeHtmlEncode(expiry);
+            }
+        }
+
+        SendHtml(res, BuildResultPage(computerName ?? hostname, password, expiryDisplay, user, IsSessionAdmin(sessionId)), sessionId);
+    }
+
+    private string CreateSession(string username, bool isAdmin)
+    {
+        string sessionId = GenerateSessionId();
+        lock (sessions)
+        {
+            sessions[sessionId] = new SessionData { User = username, IsAdmin = isAdmin, LoginTime = DateTime.Now };
+        }
+        return sessionId;
+    }
+
+    private bool IsSessionValid(string sessionId)
+    {
+        if (string.IsNullOrEmpty(sessionId)) return false;
+        lock (sessions)
+        {
+            return sessions.ContainsKey(sessionId);
+        }
+    }
+
+    private string GetSessionUser(string sessionId)
+    {
+        if (string.IsNullOrEmpty(sessionId)) return "";
+        lock (sessions)
+        {
+            if (sessions.ContainsKey(sessionId))
+            {
+                return sessions[sessionId].User;
+            }
+        }
+        return "";
+    }
+
+    private bool IsSessionAdmin(string sessionId)
+    {
+        if (string.IsNullOrEmpty(sessionId)) return false;
+        lock (sessions)
+        {
+            if (sessions.ContainsKey(sessionId))
+            {
+                return sessions[sessionId].IsAdmin;
+            }
+        }
+        return false;
+    }
+
+    private bool IsUserAuthorized(string username)
+    {
+        lock (authorizedUsers)
+        {
+            return authorizedUsers.ContainsKey(username.ToUpper());
+        }
+    }
+
+    private bool AuthenticateWithDomain(string username, string password)
+    {
+        try
+        {
+            System.DirectoryServices.DirectoryEntry entry = new System.DirectoryServices.DirectoryEntry(
+                "LDAP://IDPBGTN.COM",
+                "IDPBGTN\\" + username,
+                password
+            );
+            object obj = entry.NativeObject;
+            entry.Dispose();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            LogEvent("Domain authentication failed for " + username + ": " + ex.Message);
+            return false;
+        }
+    }
+
+    private string GenerateSessionId()
+    {
+        byte[] randomBytes = new byte[32];
+        using (var rng = new RNGCryptoServiceProvider())
+        {
+            rng.GetBytes(randomBytes);
+        }
+        return Convert.ToBase64String(randomBytes).Replace("+", "-").Replace("/", "_").Replace("=", "");
+    }
+
+    private string GetSessionCookie(HttpListenerRequest req)
+    {
+        try
+        {
+            if (req.Cookies != null)
+            {
+                Cookie sessionCookie = req.Cookies["LAPS_SESSION"];
+                if (sessionCookie != null)
+                {
+                    return sessionCookie.Value;
+                }
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    private void ClearSessionCookie(HttpListenerResponse res)
+    {
+        Cookie cookie = new Cookie("LAPS_SESSION", "")
+        {
+            Expires = DateTime.Now.AddDays(-1),
+            Path = "/"
+        };
+        res.SetCookie(cookie);
+    }
+
+    private Dictionary<string, string> ParseFormData(string body)
+    {
+        Dictionary<string, string> result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (string.IsNullOrEmpty(body)) return result;
+
+        string[] pairs = body.Split('&');
+        foreach (string pair in pairs)
+        {
+            string[] kv = pair.Split(new char[] { '=' }, 2);
+            if (kv.Length == 2)
+                result[System.Web.HttpUtility.UrlDecode(kv[0])] = System.Web.HttpUtility.UrlDecode(kv[1]);
+        }
+        return result;
+    }
+
+    private Dictionary<string, string> ParseSimpleJson(string json)
+    {
+        Dictionary<string, string> result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(json)) return result;
+        
+        try
+        {
+            JavaScriptSerializer serializer = new JavaScriptSerializer();
+            var dict = serializer.Deserialize<Dictionary<string, object>>(json);
+            if (dict != null)
+            {
+                foreach (var kvp in dict)
+                {
+                    result[kvp.Key] = kvp.Value != null ? kvp.Value.ToString() : "";
+                }
+            }
+        }
+        catch { }
+
+        return result;
+    }
+
+    private void SendHtml(HttpListenerResponse res, string html, string sessionId)
+    {
+        byte[] buffer = Encoding.UTF8.GetBytes(html);
+        res.ContentType = "text/html; charset=utf-8";
+        res.ContentLength64 = buffer.Length;
+
+        if (!string.IsNullOrEmpty(sessionId))
+        {
+            Cookie cookie = new Cookie("LAPS_SESSION", sessionId)
+            {
+                Path = "/",
+                HttpOnly = true,
+                Secure = false
+            };
+            res.SetCookie(cookie);
+        }
+
+        res.OutputStream.Write(buffer, 0, buffer.Length);
+    }
+
+    private void SendJson(HttpListenerResponse res, object data)
+    {
+        JavaScriptSerializer serializer = new JavaScriptSerializer();
+        string json = serializer.Serialize(data);
+        byte[] buffer = Encoding.UTF8.GetBytes(json);
+        res.ContentType = "application/json; charset=utf-8";
+        res.ContentLength64 = buffer.Length;
+        res.OutputStream.Write(buffer, 0, buffer.Length);
+    }
+
+    private string SafeHtmlEncode(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return s;
+        return s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;").Replace("\"", "&quot;");
+    }
+
+    private string SafeHtmlAttributeEncode(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return s;
+        return s.Replace("&", "&amp;").Replace("\"", "&quot;");
+    }
+
+    private string BuildLoginPage(string message)
+    {
+        string messageHtml = "";
+        if (!string.IsNullOrEmpty(message))
+        {
+            string msgClass = message.Contains("successfully") ? "alert-success" : "alert-error";
+            messageHtml = "<div class='alert " + msgClass + "'>" + SafeHtmlEncode(message) + "</div>";
+        }
+
+        string body = @"
+<div class='card'>
+    <div class='card-header'>
+        <h1>LAPS Password Portal</h1>
+        <p>Secure Access to Local Administrator Passwords</p>
+    </div>
+    " + messageHtml + @"
+    <form method='POST' action='/login'>
+        <div class='form-group'>
+            <label for='username'>Username</label>
+            <input type='text' id='username' name='username' placeholder='ADMIN or domain username' required autofocus>
+            <small class='help-hint'>Admin: Use <strong>ADMIN</strong> | User: Use your domain username</small>
+        </div>
+        <div class='form-group'>
+            <label for='password'>Password</label>
+            <input type='password' id='password' name='password' placeholder='Password' required>
+            <small class='help-hint'>Admin: ADMIN123 | User: Your domain password</small>
+        </div>
+        <button type='submit' class='btn btn-primary'>Login</button>
+    </form>
+</div>";
+
+        return GetPageTemplate(body);
+    }
+
+    private string BuildMainPage(string message, string messageType, string prefillHostname, string username, bool isAdmin)
+    {
+        string statusHtml = "";
+        if (!string.IsNullOrEmpty(message))
+        {
+            statusHtml = "<div class='alert alert-" + messageType + "'>" + SafeHtmlEncode(message) + "</div>";
+        }
+
+        string hostValue = "";
+        if (!string.IsNullOrEmpty(prefillHostname))
+        {
+            hostValue = " value='" + SafeHtmlAttributeEncode(prefillHostname) + "'";
+        }
+
+        string adminLink = isAdmin ? "<a href='/admin' class='btn btn-secondary btn-small'>Settings</a>" : "";
+
+        string body = @"
+<div class='card'>
+    <div class='card-header'>
+        <div class='header-top'>
+            <div>
+                <h1>LAPS Password Retrieval</h1>
+                <p>Enter computer hostname to retrieve local administrator password</p>
+            </div>
+            <div class='user-section'>
+                <div>User: <span class='user-name'>" + SafeHtmlEncode(username) + @"</span></div>
+                <div class='button-group'>
+                    <a href='/logout-page' class='btn btn-secondary btn-small'>Logout</a>
+                    " + adminLink + @"
+                </div>
+            </div>
+        </div>
+    </div>
+    " + statusHtml + @"
+    <form method='POST' action='/get-laps' id='lapsForm'>
+        <div class='form-group'>
+            <label for='hostname'>Computer Hostname</label>
+            <input type='text' id='hostname' name='hostname' placeholder='WKSTN-IT-001.idpbgtn.com' required autofocus autocomplete='off'" + hostValue + @">
+        </div>
+        <button type='submit' class='btn btn-primary'>
+            <span class='btn-text'>Retrieve Password</span>
+            <span class='btn-loader' style='display:none;'>Querying AD...</span>
+        </button>
+    </form>
+    <div class='help-text'><strong>Tip:</strong> Use the full FQDN for best results. LAPS passwords expire periodically.</div>
+</div>
+<script>
+document.getElementById('lapsForm').addEventListener('submit', function(e) { 
+    var btn = this.querySelector('button'); 
+    btn.disabled = true; 
+    btn.querySelector('.btn-text').style.display = 'none'; 
+    btn.querySelector('.btn-loader').style.display = 'inline'; 
+});
+</script>";
+        
+        return GetPageTemplate(body);
+    }
+
+    private string BuildResultPage(string computer, string password, string expiryHtml, string username, bool isAdmin)
+    {
+        string adminLink = isAdmin ? "<a href='/admin' class='btn btn-secondary' style='margin: 0 6px;'>Settings</a>" : "";
+
+        string body = @"
+<div class='card'>
+    <div class='card-header'>
+        <div class='header-top'>
+            <div>
+                <h1>Password Retrieved</h1>
+            </div>
+            <div class='user-section'>
+                <div>User: <span class='user-name'>" + SafeHtmlEncode(username) + @"</span></div>
+                <div class='button-group'>
+                    <a href='/logout-page' class='btn btn-secondary btn-small'>Logout</a>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class='result-grid'>
+        <div class='result-item'>
+            <span class='result-label'>Computer</span>
+            <span class='result-value'>" + SafeHtmlEncode(computer) + @"</span>
+        </div>
+        <div class='result-item'>
+            <span class='result-label'>Password</span>
+            <div class='password-container'>
+                <span id='pwd' class='password-blur' onclick='toggleReveal()'>" + SafeHtmlEncode(password) + @"</span>
+                <button type='button' class='btn btn-small btn-secondary' onclick='copyPassword()' id='copyBtn'>Copy</button>
+            </div>
+            <small class='hint'>Click password to reveal, Click Copy to copy</small>
+        </div>
+        <div class='result-item'>
+            <span class='result-label'>Expiration</span>
+            <span class='result-value'>" + expiryHtml + @"</span>
+        </div>
+    </div>
+    <div class='actions'>
+        <a href='/' class='btn btn-secondary'>Query Another</a>
+        " + adminLink + @"
+    </div>
+</div>
+<script>
+function toggleReveal() { 
+    var el = document.getElementById('pwd'); 
+    el.classList.toggle('password-blur'); 
+    el.classList.toggle('password-clear'); 
+}
+
+function copyPassword() { 
+    var pwd = document.getElementById('pwd').innerText; 
+    var btn = document.getElementById('copyBtn');
+    var originalText = btn.innerHTML;
+    
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(pwd).then(function() { 
+            btn.innerHTML = 'Copied!'; 
+            btn.classList.add('copied');
+            setTimeout(function() { btn.innerHTML = originalText; btn.classList.remove('copied'); }, 2000); 
+        }).catch(function() {
+            fallbackCopy(pwd, btn, originalText);
+        });
+    } else {
+        fallbackCopy(pwd, btn, originalText);
+    }
+}
+
+function fallbackCopy(text, btn, originalText) {
+    var textarea = document.createElement('textarea');
+    textarea.value = text;
+    document.body.appendChild(textarea);
+    textarea.select();
+    try {
+        document.execCommand('copy');
+        btn.innerHTML = 'Copied!'; 
+        btn.classList.add('copied');
+        setTimeout(function() { btn.innerHTML = originalText; btn.classList.remove('copied'); }, 2000);
+    } catch (err) {
+        alert('Failed to copy password');
+    }
+    document.body.removeChild(textarea);
+}
+</script>";
+        
+        return GetPageTemplate(body);
+    }
+
+    private string BuildAdminPage(string message, string username)
+    {
+        string messageHtml = "";
+        if (!string.IsNullOrEmpty(message))
+        {
+            string msgClass = message.Contains("successfully") ? "alert-success" : "alert-error";
+            messageHtml = "<div class='alert " + msgClass + "'>" + SafeHtmlEncode(message) + "</div>";
+        }
+
+        string body = @"
+<div class='card' style='max-width: 600px;'>
+    <div class='card-header'>
+        <div class='header-top'>
+            <div>
+                <h1>Settings</h1>
+                <p>Manage authorized users</p>
+            </div>
+            <div class='user-section'>
+                <div>Admin: <span class='user-name'>" + SafeHtmlEncode(username) + @"</span></div>
+                <div class='button-group'>
+                    <a href='/' class='btn btn-secondary btn-small'>Back</a>
+                    <a href='/logout-page' class='btn btn-secondary btn-small'>Logout</a>
+                </div>
+            </div>
+        </div>
+    </div>
+    " + messageHtml + @"
+    <div class='admin-section'>
+        <div class='admin-subsection'>
+            <h2>Add Domain User</h2>
+            <form id='addUserForm'>
+                <div class='form-group'>
+                    <label for='new_username'>Domain Username</label>
+                    <input type='text' id='new_username' name='new_username' placeholder='john.doe' required autocomplete='off'>
+                    <small class='help-hint'>User will be able to login with their domain password</small>
+                </div>
+                <button type='submit' class='btn btn-primary btn-small'>Add User</button>
+            </form>
+        </div>
+        <div class='admin-subsection'>
+            <h2>Authorized Users</h2>
+            <div id='usersList' class='users-list'>
+                <p>Loading...</p>
+            </div>
+        </div>
+    </div>
+</div>
+<script>
+function loadUsers() {
+    fetch('/admin/get-users')
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            var html = '';
+            if (data.users && data.users.length > 0) {
+                data.users.forEach(function(u) {
+                    var isAdmin = u.username === 'ADMIN' ? ' (Built-in)' : '';
+                    html += '<div class=user-item><span>' + u.username + isAdmin + '</span>';
+                    if (u.username !== 'ADMIN') {
+                        html += '<button type=button class=btn onclick=removeUser(""' + u.username + '"")>Remove</button>';
+                    }
+                    html += '</div>';
+                });
+            } else {
+                html = '<p>No users found</p>';
+            }
+            document.getElementById('usersList').innerHTML = html;
+        });
+}
+
+function removeUser(username) {
+    if (!confirm('Remove user ' + username + '?')) return;
+    fetch('/admin/remove-user', {
+        method: 'POST',
+        body: 'username=' + encodeURIComponent(username)
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+        alert(data.message);
+        loadUsers();
+    });
+}
+
+document.getElementById('addUserForm').addEventListener('submit', function(e) {
+    e.preventDefault();
+    var username = document.getElementById('new_username').value;
+    fetch('/admin/add-user', {
+        method: 'POST',
+        body: 'new_username=' + encodeURIComponent(username)
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+        alert(data.message);
+        if (data.success) {
+            document.getElementById('new_username').value = '';
+            loadUsers();
+        }
+    });
+});
+
+loadUsers();
+</script>";
+
+        return GetPageTemplate(body);
+    }
+
+    private string GetPageTemplate(string bodyContent)
+    {
+        return @"<!DOCTYPE html>
+<html lang='en'>
+<head>
+    <meta charset='UTF-8'>
+    <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+    <title>LAPS Password Portal</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
+        .card { background: white; border-radius: 16px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); width: 100%; max-width: 480px; overflow: hidden; }
+        .card-header { background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); color: white; padding: 28px; }
+        .header-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; }
+        .card-header h1 { font-size: 1.5rem; font-weight: 600; margin-bottom: 6px; }
+        .card-header p { opacity: 0.9; font-size: 0.875rem; }
+        .user-section { text-align: right; white-space: nowrap; }
+        .user-section > div:first-child { color: #e0e0e0; font-size: 0.85rem; margin-bottom: 8px; }
+        .user-name { font-weight: 600; color: #ffffff; }
+        .button-group { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+        .card > *:not(.card-header) { padding: 24px 28px; }
+        .alert { padding: 14px 18px; border-radius: 8px; margin-bottom: 20px; font-size: 0.875rem; line-height: 1.5; }
+        .alert-error { background: #fee2e2; color: #991b1b; border: 1px solid #fecaca; }
+        .alert-success { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
+        .form-group { margin-bottom: 20px; }
+        label { display: block; font-size: 0.875rem; font-weight: 600; color: #374151; margin-bottom: 6px; }
+        input[type='text'], input[type='password'] { width: 100%; padding: 12px 16px; border: 2px solid #e5e7eb; border-radius: 8px; font-size: 1rem; transition: all 0.2s; }
+        input[type='text']:focus, input[type='password']:focus { outline: none; border-color: #667eea; box-shadow: 0 0 0 3px rgba(102,126,234,0.1); }
+        .help-hint { display: block; margin-top: 6px; font-size: 0.75rem; color: #9ca3af; font-style: italic; }
+        .btn { display: inline-flex; align-items: center; justify-content: center; padding: 12px 24px; border: none; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; transition: all 0.2s; text-decoration: none; }
+        .btn-primary { background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); color: white; width: 100%; }
+        .btn-primary:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 8px 20px rgba(102,126,234,0.4); }
+        .btn-primary:disabled { opacity: 0.7; cursor: not-allowed; }
+        .btn-secondary { background: #f3f4f6; color: #374151; border: none; }
+        .btn-secondary:hover { background: #e5e7eb; }
+        .btn-small { padding: 6px 12px; font-size: 0.875rem; width: auto; }
+        .btn.copied { background: linear-gradient(90deg, #10b981 0%, #059669 100%); color: white; }
+        .help-text { margin-top: 20px; padding-top: 20px; border-top: 1px solid #e5e7eb; font-size: 0.875rem; color: #6b7280; }
+        .result-grid { display: flex; flex-direction: column; gap: 20px; }
+        .result-item { padding: 16px; background: #f9fafb; border-radius: 8px; }
+        .result-label { display: block; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: #6b7280; margin-bottom: 8px; }
+        .result-value { font-size: 1rem; color: #111827; word-break: break-all; }
+        .password-container { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+        .password-blur { filter: blur(6px); user-select: none; cursor: pointer; font-family: 'Consolas','Monaco',monospace; font-size: 1.125rem; letter-spacing: 0.05em; transition: filter 0.2s; flex: 1; min-width: 200px; }
+        .password-clear { filter: none; user-select: all; cursor: pointer; font-family: 'Consolas','Monaco',monospace; font-size: 1.125rem; letter-spacing: 0.05em; flex: 1; min-width: 200px; }
+        .hint { display: block; margin-top: 8px; color: #9ca3af; font-size: 0.75rem; }
+        .actions { padding-top: 20px; border-top: 1px solid #e5e7eb; display: flex; gap: 12px; }
+        .actions .btn { margin: 0; }
+        .expiry-ok { color: #166534; font-weight: 600; }
+        .expiry-warning { color: #92400e; font-weight: 600; }
+        .expiry-critical { color: #991b1b; font-weight: 600; animation: pulse 2s infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+        .admin-section { display: flex; flex-direction: column; gap: 30px; }
+        .admin-subsection { padding: 20px; background: #f9fafb; border-radius: 8px; }
+        .admin-subsection h2 { font-size: 1.125rem; margin-bottom: 16px; color: #111827; }
+        .users-list { display: flex; flex-direction: column; gap: 10px; }
+        .user-item { display: flex; justify-content: space-between; align-items: center; padding: 12px; background: white; border-radius: 6px; border: 1px solid #e5e7eb; }
+        .user-item span { font-weight: 500; color: #374151; }
+        @media (max-width: 600px) {
+            .header-top { flex-direction: column; }
+            .user-section { text-align: left; }
+            .button-group { justify-content: flex-start; }
+        }
+    </style>
+</head>
+<body>" + bodyContent + @"</body></html>";
+    }
+}
+'@
+
+try {
+    Add-Type -TypeDefinition $CSharpCode -Language CSharp -ReferencedAssemblies "System.Web", "System", "System.Web.Extensions", "System.DirectoryServices" -ErrorAction Stop
+    Write-Host "[OK] C# server compiled successfully" -ForegroundColor Green
+} catch {
+    Write-Host "[FAIL] Compilation failed: $($_.Exception.Message)" -ForegroundColor Red
+    exit 1
+}
+
+# Create server instance (Paths and users are initialized inside the C# constructor)
+$server = New-Object LapsWebServer("10.209.110.220", 8080)
+
+# Graceful shutdown handler
+$null = Register-ObjectEvent -InputObject ([System.Console]) -EventName "CancelKeyPress" -Action {
+    Write-Host "`n[SHUTDOWN] Stopping server..." -ForegroundColor Yellow
+    $server.Stop()
+    exit 0
+}
+
+try {
+    Write-Host "`n========================================" -ForegroundColor Cyan
+    Write-Host "  LAPS Web Server Active" -ForegroundColor Green
+    Write-Host "  URL: http://10.209.110.220:8080/" -ForegroundColor White
+    Write-Host "  Admin: ADMIN / ADMIN123" -ForegroundColor Yellow
+    Write-Host "  Logs & Data: D:\LAPS_WEB_PORTAL" -ForegroundColor Magenta
+    Write-Host "========================================" -ForegroundColor Cyan
+    Write-Host "`nPress Ctrl+C to stop`n" -ForegroundColor Gray
+    $server.Start()
+} catch {
+    Write-Host "`n[FAIL] Server failed: $($_.Exception.Message)" -ForegroundColor Red
+}
