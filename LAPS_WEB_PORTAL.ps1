@@ -1,4 +1,4 @@
-#requires -Modules LAPS
+﻿#requires -Modules LAPS
 #requires -Version 5.1
 
 [CmdletBinding()]
@@ -34,994 +34,394 @@ try {
     exit 1
 }
 
-# ==================== C# WEB SERVER ====================
-Write-Host "Compiling C# Web Server..." -ForegroundColor Cyan
+# ==================== GLOBAL STATE ====================
+$Global:SessionData = @{}
+$Global:AuthorizedUsers = @{}
+$Global:LoginAttempts = @{}
+$Global:SessionLock = [System.Object]::new()
+$Global:LoginLock = [System.Object]::new()
+$Global:LogLock = [System.Object]::new()
 
-$CSharpCode = @'
-using System;
-using System.Net;
-using System.Text;
-using System.IO;
-using System.Collections;
-using System.Collections.Generic;
-using System.Threading;
-using System.Diagnostics;
-using System.Web;
-using System.Web.Script.Serialization;
-using System.Security.Cryptography;
+$MAX_LOGIN_ATTEMPTS = 5
+$LOCKOUT_MINUTES = 15
+$SESSION_TIMEOUT_MINUTES = 15
 
-public class SessionData
-{
-    public string User { get; set; }
-    public bool IsAdmin { get; set; }
-    public DateTime LoginTime { get; set; }
-    public string IPAddress { get; set; }
+# ==================== INITIALIZATION ====================
+Write-Host "Initializing Portal..." -ForegroundColor Cyan
+
+# Add built-in admin
+$Global:AuthorizedUsers["ADMIN"] = @{
+    username = "ADMIN"
+    name     = "Administrator"
+    authorized = $true
+    addedBy  = "SYSTEM"
+    addedDate = Get-Date
 }
 
-public class LoginAttempt
-{
-    public string IPAddress { get; set; }
-    public int FailureCount { get; set; }
-    public DateTime LastAttempt { get; set; }
+# Load authorized users from file
+function LoadAuthorizedUsersFromFile {
+    try {
+        $userFile = Join-Path $UserDetailsPath "authorized_users.json"
+        if (Test-Path $userFile) {
+            $content = Get-Content $userFile -Raw
+            $loaded = $content | ConvertFrom-Json
+            if ($loaded) {
+                [System.Threading.Monitor]::Enter($Global:AuthorizedUsers)
+                try {
+                    $Global:AuthorizedUsers.Clear()
+                    $loaded.PSObject.Properties | ForEach-Object {
+                        $Global:AuthorizedUsers[$_.Name] = @{
+                            username   = $_.Value.username
+                            name       = $_.Value.name
+                            authorized = $_.Value.authorized
+                            addedBy    = $_.Value.addedBy
+                            addedDate  = $_.Value.addedDate
+                        }
+                    }
+                } finally {
+                    [System.Threading.Monitor]::Exit($Global:AuthorizedUsers)
+                }
+            }
+        }
+    } catch {
+        Write-Host "Warning: Could not load authorized users: $_" -ForegroundColor Yellow
+    }
 }
 
-public class LapsWebServer
-{
-    private HttpListener listener;
-    private readonly string ip;
-    private readonly int port;
-    private volatile bool running = true;
-    private readonly Dictionary<string, SessionData> sessions = new Dictionary<string, SessionData>();
-    private Dictionary<string, object> authorizedUsers = new Dictionary<string, object>();
-    private string logPath;
-    private string userDetailsPath;
-    private string portalStatusPath;
-    private object logLock = new object();
-    private object loginLock = new object();
-    private Dictionary<string, LoginAttempt> loginAttempts = new Dictionary<string, LoginAttempt>();
-    private const int MAX_LOGIN_ATTEMPTS = 5;
-    private const int LOCKOUT_MINUTES = 15;
-
-    public LapsWebServer(string serverIp, int serverPort, string logs, string userDetails, string statusPath)
-    {
-        ip = serverIp;
-        port = serverPort;
-        logPath = logs;
-        userDetailsPath = userDetails;
-        portalStatusPath = statusPath;
-        authorizedUsers = new Dictionary<string, object>();
-        authorizedUsers["ADMIN"] = new { authorized = true, addedBy = "SYSTEM", addedDate = DateTime.Now };
-        LoadAuthorizedUsersFromFile();
-    }
-
-    private void LoadAuthorizedUsersFromFile()
-    {
-        try
-        {
-            string userFile = Path.Combine(userDetailsPath, "authorized_users.json");
-            if (File.Exists(userFile))
-            {
-                string content = File.ReadAllText(userFile);
-                JavaScriptSerializer serializer = new JavaScriptSerializer();
-                var loadedUsers = serializer.Deserialize<Dictionary<string, object>>(content);
-                if (loadedUsers != null)
-                {
-                    lock (authorizedUsers)
-                    {
-                        authorizedUsers = loadedUsers;
-                    }
-                }
-            }
+# Save authorized users to file
+function SaveAuthorizedUsersToFile {
+    try {
+        $userFile = Join-Path $UserDetailsPath "authorized_users.json"
+        [System.Threading.Monitor]::Enter($Global:AuthorizedUsers)
+        try {
+            $json = $Global:AuthorizedUsers | ConvertTo-Json
+            Set-Content -Path $userFile -Value $json -Encoding UTF8 -Force
+        } finally {
+            [System.Threading.Monitor]::Exit($Global:AuthorizedUsers)
         }
-        catch { }
+    } catch {
+        Write-Host "Warning: Could not save authorized users: $_" -ForegroundColor Yellow
     }
+}
 
-    private void SaveAuthorizedUsersToFile()
-    {
-        try
-        {
-            string userFile = Path.Combine(userDetailsPath, "authorized_users.json");
-            JavaScriptSerializer serializer = new JavaScriptSerializer();
-            lock (authorizedUsers)
-            {
-                string json = serializer.Serialize(authorizedUsers);
-                File.WriteAllText(userFile, json, Encoding.UTF8);
-            }
+LoadAuthorizedUsersFromFile
+
+# ==================== SESSION MANAGEMENT ====================
+function CreateSession {
+    param([string]$Username, [string]$UserFullName, [bool]$IsAdmin, [string]$IPAddress)
+    
+    $sessionId = [System.Convert]::ToBase64String((1..32 | ForEach-Object { [byte](Get-Random -Minimum 0 -Maximum 256) })) -replace '\+', '-' -replace '/', '_' -replace '=', ''
+    
+    [System.Threading.Monitor]::Enter($Global:SessionLock)
+    try {
+        $Global:SessionData[$sessionId] = @{
+            User         = $Username
+            UserName     = $UserFullName
+            IsAdmin      = $IsAdmin
+            LoginTime    = Get-Date
+            LastActivity = Get-Date
+            IPAddress    = $IPAddress
         }
-        catch { }
+    } finally {
+        [System.Threading.Monitor]::Exit($Global:SessionLock)
     }
+    
+    return $sessionId
+}
 
-    private bool IsIPLocked(string ipAddress)
-    {
-        lock (loginLock)
-        {
-            if (loginAttempts.ContainsKey(ipAddress))
-            {
-                LoginAttempt attempt = loginAttempts[ipAddress];
-                TimeSpan timeSinceLastAttempt = DateTime.Now - attempt.LastAttempt;
-                
-                if (timeSinceLastAttempt.TotalMinutes > LOCKOUT_MINUTES)
-                {
-                    loginAttempts.Remove(ipAddress);
-                    return false;
-                }
-                
-                return attempt.FailureCount >= MAX_LOGIN_ATTEMPTS;
-            }
-            return false;
-        }
-    }
-
-    private void RecordFailedLogin(string ipAddress)
-    {
-        lock (loginLock)
-        {
-            if (loginAttempts.ContainsKey(ipAddress))
-            {
-                LoginAttempt attempt = loginAttempts[ipAddress];
-                attempt.FailureCount++;
-                attempt.LastAttempt = DateTime.Now;
-            }
-            else
-            {
-                loginAttempts[ipAddress] = new LoginAttempt 
-                { 
-                    IPAddress = ipAddress, 
-                    FailureCount = 1, 
-                    LastAttempt = DateTime.Now 
-                };
-            }
-        }
-    }
-
-    private void ClearFailedLogins(string ipAddress)
-    {
-        lock (loginLock)
-        {
-            if (loginAttempts.ContainsKey(ipAddress))
-            {
-                loginAttempts.Remove(ipAddress);
-            }
-        }
-    }
-
-    private void LogActivity(string activityType, string username, string ipAddress, string details, string status = "SUCCESS", string hostname = "")
-    {
-        try
-        {
-            lock (logLock)
-            {
-                string timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
-                string dateForFile = DateTime.Now.ToString("yyyy-MM-dd");
-                
-                // Activity log
-                string activityLogFile = Path.Combine(logPath, "LAPS_Activity_" + dateForFile + ".log");
-                var logEntry = new
-                {
-                    Timestamp = timestamp,
-                    ActivityType = activityType,
-                    Username = username,
-                    IPAddress = ipAddress,
-                    Hostname = hostname,
-                    Details = details,
-                    Status = status
-                };
-
-                JavaScriptSerializer serializer = new JavaScriptSerializer();
-                string jsonLog = serializer.Serialize(logEntry);
-                File.AppendAllText(activityLogFile, jsonLog + Environment.NewLine, Encoding.UTF8);
-
-                // Portal status log for LOGIN/LOGOUT tracking
-                if (activityType == "LOGIN" || activityType == "LOGOUT" || activityType == "LOGIN_FAILED" || activityType == "LOGIN_BLOCKED")
-                {
-                    string statusLogFile = Path.Combine(portalStatusPath, "Portal_Status_" + dateForFile + ".log");
-                    string statusEntry = "[" + timestamp + "] [" + activityType + "] User: " + username + 
-                                        " | IP: " + ipAddress + " | Status: " + status;
-                    
-                    if (activityType == "LOGIN" || activityType == "LOGOUT")
-                    {
-                        if (activityType == "LOGIN")
-                            statusEntry += " | EVENT: Portal Opened and Active";
-                        else
-                            statusEntry += " | EVENT: Portal Closed/Logged Out";
-                    }
-                    
-                    File.AppendAllText(statusLogFile, statusEntry + Environment.NewLine, Encoding.UTF8);
-                }
-
-                // Write to console via Debug output
-                Console.WriteLine("[ACTIVITY] [" + timestamp + "] [" + activityType + "] User: " + username + " | IP: " + ipAddress + " | Status: " + status + " | Details: " + details);
-            }
-        }
-        catch { }
-    }
-
-    public void SetAuthorizedUsers(Hashtable hashtable)
-    {
-        if (hashtable == null) return;
+function IsSessionValid {
+    param([string]$SessionId)
+    
+    if ([string]::IsNullOrEmpty($SessionId)) { return $false }
+    
+    [System.Threading.Monitor]::Enter($Global:SessionLock)
+    try {
+        if (-not $Global:SessionData.ContainsKey($SessionId)) { return $false }
         
-        lock (authorizedUsers)
-        {
-            authorizedUsers.Clear();
-            foreach (DictionaryEntry entry in hashtable)
-            {
-                authorizedUsers[(string)entry.Key] = entry.Value;
-            }
-        }
-    }
-
-    public void Start()
-    {
-        listener = new HttpListener();
-        string prefix = "http://" + ip + ":" + port.ToString() + "/";
-        listener.Prefixes.Add(prefix);
+        $session = $Global:SessionData[$SessionId]
+        $elapsed = (Get-Date) - $session.LastActivity
         
-        try
-        {
-            listener.Start();
-            Console.WriteLine("[SERVER_START] Listening on " + prefix);
+        if ($elapsed.TotalMinutes -ge $SESSION_TIMEOUT_MINUTES) {
+            $Global:SessionData.Remove($SessionId)
+            return $false
         }
-        catch (HttpListenerException ex)
-        {
-            Console.WriteLine("[SERVER_ERROR] Cannot bind to " + ip + ":" + port.ToString());
-            Console.WriteLine("              Error: " + ex.Message);
-            throw;
-        }
-
-        while (running)
-        {
-            try
-            {
-                HttpListenerContext context = listener.GetContext();
-                ThreadPool.QueueUserWorkItem(new WaitCallback(ProcessRequestCallback), context);
-            }
-            catch (HttpListenerException) { }
-            catch (ObjectDisposedException) { }
-            catch (Exception ex)
-            {
-                Console.WriteLine("[SERVER_ERROR] Exception: " + ex.Message);
-            }
-        }
+        
+        $session.LastActivity = Get-Date
+        return $true
+    } finally {
+        [System.Threading.Monitor]::Exit($Global:SessionLock)
     }
+}
 
-    public void Stop()
-    {
-        running = false;
-        if (listener != null)
-        {
-            try
-            {
-                listener.Stop();
-                listener.Close();
-            }
-            catch { }
+function GetSessionUser {
+    param([string]$SessionId)
+    if ([string]::IsNullOrEmpty($SessionId)) { return "" }
+    
+    [System.Threading.Monitor]::Enter($Global:SessionLock)
+    try {
+        if ($Global:SessionData.ContainsKey($SessionId)) {
+            return $Global:SessionData[$SessionId].User
         }
+    } finally {
+        [System.Threading.Monitor]::Exit($Global:SessionLock)
     }
+    return ""
+}
 
-    private void ProcessRequestCallback(object state)
-    {
-        try
-        {
-            HttpListenerContext context = (HttpListenerContext)state;
-            ProcessRequest(context);
+function GetSessionUserName {
+    param([string]$SessionId)
+    if ([string]::IsNullOrEmpty($SessionId)) { return "" }
+    
+    [System.Threading.Monitor]::Enter($Global:SessionLock)
+    try {
+        if ($Global:SessionData.ContainsKey($SessionId)) {
+            return $Global:SessionData[$SessionId].UserName
         }
-        catch (Exception ex)
-        {
-            Console.WriteLine("[REQUEST_ERROR] " + ex.Message);
-        }
+    } finally {
+        [System.Threading.Monitor]::Exit($Global:SessionLock)
     }
+    return ""
+}
 
-    private void ProcessRequest(HttpListenerContext context)
-    {
-        HttpListenerRequest req = null;
-        HttpListenerResponse res = null;
-
-        try
-        {
-            req = context.Request;
-            res = context.Response;
-
-            string path = req.Url.AbsolutePath.ToLower();
-            string method = req.HttpMethod;
-            string sessionId = GetSessionCookie(req);
-            string clientIp = req.RemoteEndPoint.Address.ToString();
-
-            if (method == "GET" && (path == "/" || path == "/index.html"))
-            {
-                if (string.IsNullOrEmpty(sessionId) || !IsSessionValid(sessionId))
-                {
-                    LogActivity("PAGE_ACCESS", "Anonymous", clientIp, "Accessed login page", "INFO");
-                    SendHtml(res, BuildLoginPage(null), null);
-                }
-                else
-                {
-                    SendHtml(res, BuildMainPage(null, null, null, GetSessionUser(sessionId), IsSessionAdmin(sessionId)), sessionId);
-                }
-            }
-            else if (method == "POST" && path == "/login")
-            {
-                HandleLogin(req, res, clientIp);
-            }
-            else if (method == "GET" && path == "/logout-page")
-            {
-                string user = GetSessionUser(sessionId);
-                LogActivity("LOGOUT", user, clientIp, "User logged out", "SUCCESS");
-                ClearSessionCookie(res);
-                lock (sessions)
-                {
-                    if (!string.IsNullOrEmpty(sessionId) && sessions.ContainsKey(sessionId))
-                    {
-                        sessions.Remove(sessionId);
-                    }
-                }
-                SendHtml(res, BuildLoginPage("Logged out successfully"), null);
-            }
-            else if (method == "POST" && path == "/get-laps")
-            {
-                if (!IsSessionValid(sessionId))
-                {
-                    res.StatusCode = 401;
-                    SendJson(res, new { error = "Unauthorized" });
-                    return;
-                }
-                HandleLapsQuery(req, res, sessionId, clientIp);
-            }
-            else if (method == "GET" && path == "/admin")
-            {
-                if (!IsSessionValid(sessionId) || !IsSessionAdmin(sessionId))
-                {
-                    res.StatusCode = 403;
-                    SendHtml(res, BuildLoginPage("Access denied"), null);
-                    return;
-                }
-                SendHtml(res, BuildAdminPage(null, GetSessionUser(sessionId)), sessionId);
-            }
-            else if (method == "POST" && path == "/admin/add-user")
-            {
-                if (!IsSessionValid(sessionId) || !IsSessionAdmin(sessionId))
-                {
-                    res.StatusCode = 403;
-                    SendJson(res, new { error = "Unauthorized" });
-                    return;
-                }
-                HandleAddUser(req, res, sessionId, clientIp);
-            }
-            else if (method == "POST" && path == "/admin/remove-user")
-            {
-                if (!IsSessionValid(sessionId) || !IsSessionAdmin(sessionId))
-                {
-                    res.StatusCode = 403;
-                    SendJson(res, new { error = "Unauthorized" });
-                    return;
-                }
-                HandleRemoveUser(req, res, sessionId, clientIp);
-            }
-            else if (method == "GET" && path == "/admin/get-users")
-            {
-                if (!IsSessionValid(sessionId) || !IsSessionAdmin(sessionId))
-                {
-                    res.StatusCode = 403;
-                    SendJson(res, new { error = "Unauthorized" });
-                    return;
-                }
-                HandleGetUsers(res);
-            }
-            else
-            {
-                res.StatusCode = 404;
-                SendHtml(res, "<h1>404 Not Found</h1>", null);
-            }
+function IsSessionAdmin {
+    param([string]$SessionId)
+    if ([string]::IsNullOrEmpty($SessionId)) { return $false }
+    
+    [System.Threading.Monitor]::Enter($Global:SessionLock)
+    try {
+        if ($Global:SessionData.ContainsKey($SessionId)) {
+            return $Global:SessionData[$SessionId].IsAdmin
         }
-        catch (Exception ex)
-        {
-            try
-            {
-                if (res != null)
-                {
-                    res.StatusCode = 500;
-                    SendHtml(res, "<h1>Server Error</h1><pre>" + SafeHtmlEncode(ex.ToString()) + "</pre>", null);
-                }
-            }
-            catch { }
-        }
-        finally
-        {
-            try
-            {
-                if (res != null)
-                {
-                    res.Close();
-                }
-            }
-            catch { }
-        }
+    } finally {
+        [System.Threading.Monitor]::Exit($Global:SessionLock)
     }
+    return $false
+}
 
-    private void HandleLogin(HttpListenerRequest req, HttpListenerResponse res, string clientIp)
-    {
-        string username = "";
-        string password = "";
-
-        try
-        {
-            if (IsIPLocked(clientIp))
-            {
-                LogActivity("LOGIN_BLOCKED", "Unknown", clientIp, "IP blocked due to multiple failed attempts", "BLOCKED");
-                SendHtml(res, BuildLoginPage("Too many failed login attempts. Please try again in 15 minutes."), null);
-                return;
-            }
-
-            using (StreamReader reader = new StreamReader(req.InputStream, req.ContentEncoding))
-            {
-                string body = reader.ReadToEnd();
-                Dictionary<string, string> formData = ParseFormData(body);
-                if (formData.ContainsKey("username")) username = formData["username"];
-                if (formData.ContainsKey("password")) password = formData["password"];
-            }
-
-            username = (username ?? "").Trim();
-            password = (password ?? "").Trim();
-
-            bool authSuccess = false;
-            bool isAdmin = false;
-
-            try
-            {
-                if (string.IsNullOrEmpty(username) || string.IsNullOrEmpty(password))
-                {
-                    RecordFailedLogin(clientIp);
-                    LogActivity("LOGIN_FAILED", "Unknown", clientIp, "Empty username or password", "FAILED");
-                    SendHtml(res, BuildLoginPage("Invalid credentials"), null);
-                    return;
-                }
-
-                if (username == "ADMIN" && password == "ADMIN123")
-                {
-                    authSuccess = true;
-                    isAdmin = true;
-                    ClearFailedLogins(clientIp);
-                    LogActivity("LOGIN", username, clientIp, "Admin login successful", "SUCCESS");
-                }
-                else if (IsUserAuthorized(username))
-                {
-                    if (AuthenticateWithDomain(username, password))
-                    {
-                        authSuccess = true;
-                        isAdmin = false;
-                        ClearFailedLogins(clientIp);
-                        LogActivity("LOGIN", username, clientIp, "Domain user login successful", "SUCCESS");
-                    }
-                    else
-                    {
-                        RecordFailedLogin(clientIp);
-                        LogActivity("LOGIN_FAILED", username, clientIp, "Invalid domain credentials", "FAILED");
-                        SendHtml(res, BuildLoginPage("Invalid credentials"), null);
-                        return;
-                    }
-                }
-                else
-                {
-                    RecordFailedLogin(clientIp);
-                    LogActivity("LOGIN_FAILED", username, clientIp, "Unauthorized user attempted login", "FAILED");
-                    SendHtml(res, BuildLoginPage("Invalid credentials"), null);
-                    return;
-                }
-
-                if (!authSuccess)
-                {
-                    RecordFailedLogin(clientIp);
-                    LogActivity("LOGIN_FAILED", username, clientIp, "Authentication failed", "FAILED");
-                    SendHtml(res, BuildLoginPage("Invalid credentials"), null);
-                    return;
-                }
-
-                string sessionId = CreateSession(username, isAdmin, clientIp);
-                SendHtml(res, BuildMainPage(null, null, null, username, isAdmin), sessionId);
-            }
-            catch (Exception ex)
-            {
-                RecordFailedLogin(clientIp);
-                LogActivity("LOGIN_ERROR", username, clientIp, "Login exception: " + ex.Message, "ERROR");
-                SendHtml(res, BuildLoginPage("Invalid credentials"), null);
-            }
-        }
-        catch (Exception ex)
-        {
-            try
-            {
-                RecordFailedLogin(clientIp);
-                LogActivity("LOGIN_ERROR", "Unknown", clientIp, "Request parsing error: " + ex.Message, "ERROR");
-                SendHtml(res, BuildLoginPage("Request error"), null);
-            }
-            catch { }
-        }
-    }
-
-    private void HandleAddUser(HttpListenerRequest req, HttpListenerResponse res, string sessionId, string clientIp)
-    {
-        string newUsername = "";
-        try
-        {
-            using (StreamReader reader = new StreamReader(req.InputStream, req.ContentEncoding))
-            {
-                string body = reader.ReadToEnd();
-                Dictionary<string, string> formData = ParseFormData(body);
-                if (formData.ContainsKey("new_username")) newUsername = formData["new_username"];
-            }
-
-            newUsername = (newUsername ?? "").Trim().ToUpper();
-
-            if (string.IsNullOrEmpty(newUsername))
-            {
-                LogActivity("ADD_USER_FAILED", GetSessionUser(sessionId), clientIp, "Empty username", "FAILED");
-                SendJson(res, new { success = false, message = "Username required" });
-                return;
-            }
-
-            if (newUsername.Length > 20 || !System.Text.RegularExpressions.Regex.IsMatch(newUsername, "^[a-zA-Z0-9\\-\\.]+$"))
-            {
-                LogActivity("ADD_USER_FAILED", GetSessionUser(sessionId), clientIp, "Invalid username format: " + newUsername, "FAILED");
-                SendJson(res, new { success = false, message = "Invalid username format" });
-                return;
-            }
-
-            lock (authorizedUsers)
-            {
-                if (authorizedUsers.ContainsKey(newUsername))
-                {
-                    LogActivity("ADD_USER_FAILED", GetSessionUser(sessionId), clientIp, "User already exists: " + newUsername, "FAILED");
-                    SendJson(res, new { success = false, message = "User already authorized" });
-                    return;
-                }
-
-                authorizedUsers[newUsername] = new { authorized = true, addedBy = GetSessionUser(sessionId), addedDate = DateTime.Now };
-            }
-            SaveAuthorizedUsersToFile();
-            LogActivity("ADD_USER", GetSessionUser(sessionId), clientIp, "Added user: " + newUsername, "SUCCESS");
-            SendJson(res, new { success = true, message = "User " + newUsername + " added successfully" });
-        }
-        catch (Exception ex)
-        {
-            try
-            {
-                LogActivity("ADD_USER_ERROR", GetSessionUser(sessionId), clientIp, "Exception: " + ex.Message, "ERROR");
-                SendJson(res, new { success = false, message = "An error occurred" });
-            }
-            catch { }
-        }
-    }
-
-    private void HandleRemoveUser(HttpListenerRequest req, HttpListenerResponse res, string sessionId, string clientIp)
-    {
-        string username = "";
-        try
-        {
-            using (StreamReader reader = new StreamReader(req.InputStream, req.ContentEncoding))
-            {
-                string body = reader.ReadToEnd();
-                Dictionary<string, string> formData = ParseFormData(body);
-                if (formData.ContainsKey("username")) username = formData["username"];
-            }
-
-            username = (username ?? "").Trim().ToUpper();
-
-            if (username == "ADMIN")
-            {
-                LogActivity("REMOVE_USER_FAILED", GetSessionUser(sessionId), clientIp, "Attempted to remove ADMIN", "FAILED");
-                SendJson(res, new { success = false, message = "Cannot remove ADMIN user" });
-                return;
-            }
-
-            lock (authorizedUsers)
-            {
-                if (authorizedUsers.ContainsKey(username))
-                {
-                    authorizedUsers.Remove(username);
-                    SaveAuthorizedUsersToFile();
-                    LogActivity("REMOVE_USER", GetSessionUser(sessionId), clientIp, "Removed user: " + username, "SUCCESS");
-                    SendJson(res, new { success = true, message = "User " + username + " removed successfully" });
-                }
-                else
-                {
-                    LogActivity("REMOVE_USER_FAILED", GetSessionUser(sessionId), clientIp, "User not found: " + username, "FAILED");
-                    SendJson(res, new { success = false, message = "User not found" });
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            try
-            {
-                LogActivity("REMOVE_USER_ERROR", GetSessionUser(sessionId), clientIp, "Exception: " + ex.Message, "ERROR");
-                SendJson(res, new { success = false, message = "An error occurred" });
-            }
-            catch { }
-        }
-    }
-
-    private void HandleGetUsers(HttpListenerResponse res)
-    {
-        try
-        {
-            List<object> users = new List<object>();
-            lock (authorizedUsers)
-            {
-                foreach (var kvp in authorizedUsers)
-                {
-                    users.Add(new { username = kvp.Key });
-                }
-            }
-            SendJson(res, new { users = users });
-        }
-        catch { }
-    }
-
-    private void HandleLapsQuery(HttpListenerRequest req, HttpListenerResponse res, string sessionId, string clientIp)
-    {
-        string hostname = "";
-        try
-        {
-            using (StreamReader reader = new StreamReader(req.InputStream, req.ContentEncoding))
-            {
-                string body = reader.ReadToEnd();
-                Dictionary<string, string> formData = ParseFormData(body);
-                if (formData.ContainsKey("hostname"))
-                {
-                    hostname = formData["hostname"];
-                }
-            }
-
-            hostname = (hostname ?? "").Trim();
-
-            if (string.IsNullOrEmpty(hostname))
-            {
-                LogActivity("LAPS_QUERY_FAILED", GetSessionUser(sessionId), clientIp, "Empty hostname", "FAILED", hostname);
-                SendHtml(res, BuildMainPage("Hostname is required", "error", null, GetSessionUser(sessionId), IsSessionAdmin(sessionId)), sessionId);
-                return;
-            }
-
-            if (hostname.Length > 63 || !System.Text.RegularExpressions.Regex.IsMatch(hostname, "^[a-zA-Z0-9\\-\\.]+$"))
-            {
-                LogActivity("LAPS_QUERY_FAILED", GetSessionUser(sessionId), clientIp, "Invalid hostname format: " + hostname, "FAILED", hostname);
-                SendHtml(res, BuildMainPage("Invalid hostname format", "error", null, GetSessionUser(sessionId), IsSessionAdmin(sessionId)), sessionId);
-                return;
-            }
-
-            string escapedHost = hostname.Replace("'", "''");
+# ==================== LOGIN PROTECTION ====================
+function IsIPLocked {
+    param([string]$IPAddress)
+    
+    [System.Threading.Monitor]::Enter($Global:LoginLock)
+    try {
+        if ($Global:LoginAttempts.ContainsKey($IPAddress)) {
+            $attempt = $Global:LoginAttempts[$IPAddress]
+            $timeSinceLastAttempt = (Get-Date) - $attempt.LastAttempt
             
-            string psCommand = "-NoProfile -NonInteractive -Command \"Import-Module LAPS; try { $r = Get-LapsADPassword -Identity '" 
-                + escapedHost 
-                + "' -AsPlainText -ErrorAction Stop; [PSCustomObject]@{ ComputerName = $r.ComputerName; Password = $r.Password; ExpirationTimestamp = $r.ExpirationTimestamp } | ConvertTo-Json -Compress } catch { @{ Error = $_.Exception.Message; Type = $_.Exception.GetType().Name } | ConvertTo-Json -Compress }\"";
+            if ($timeSinceLastAttempt.TotalMinutes -gt $LOCKOUT_MINUTES) {
+                $Global:LoginAttempts.Remove($IPAddress)
+                return $false
+            }
+            
+            return $attempt.FailureCount -ge $MAX_LOGIN_ATTEMPTS
+        }
+        return $false
+    } finally {
+        [System.Threading.Monitor]::Exit($Global:LoginLock)
+    }
+}
 
-            ProcessStartInfo psi = new ProcessStartInfo
-            {
-                FileName = "powershell.exe",
-                Arguments = psCommand,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.System)
-            };
+function RecordFailedLogin {
+    param([string]$IPAddress)
+    
+    [System.Threading.Monitor]::Enter($Global:LoginLock)
+    try {
+        if ($Global:LoginAttempts.ContainsKey($IPAddress)) {
+            $attempt = $Global:LoginAttempts[$IPAddress]
+            $attempt.FailureCount++
+            $attempt.LastAttempt = Get-Date
+        } else {
+            $Global:LoginAttempts[$IPAddress] = @{
+                IPAddress    = $IPAddress
+                FailureCount = 1
+                LastAttempt  = Get-Date
+            }
+        }
+    } finally {
+        [System.Threading.Monitor]::Exit($Global:LoginLock)
+    }
+}
 
-            string output = "";
-            string error = "";
-            int exitCode = 0;
+function ClearFailedLogins {
+    param([string]$IPAddress)
+    
+    [System.Threading.Monitor]::Enter($Global:LoginLock)
+    try {
+        if ($Global:LoginAttempts.ContainsKey($IPAddress)) {
+            $Global:LoginAttempts.Remove($IPAddress)
+        }
+    } finally {
+        [System.Threading.Monitor]::Exit($Global:LoginLock)
+    }
+}
 
-            using (Process proc = new Process { StartInfo = psi })
-            {
-                proc.Start();
-                output = proc.StandardOutput.ReadToEnd();
-                error = proc.StandardError.ReadToEnd();
-                proc.WaitForExit(30000);
-                exitCode = proc.ExitCode;
+# ==================== LOGGING ====================
+function LogActivity {
+    param(
+        [string]$ActivityType,
+        [string]$Username,
+        [string]$IPAddress,
+        [string]$Details,
+        [string]$Status = "SUCCESS",
+        [string]$Hostname = ""
+    )
+    
+    try {
+        [System.Threading.Monitor]::Enter($Global:LogLock)
+        try {
+            $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            $dateForFile = Get-Date -Format "yyyy-MM-dd"
+            
+            # Activity log
+            $activityLogFile = Join-Path $LogPath "LAPS_Activity_$dateForFile.log"
+            $logEntry = @{
+                Timestamp    = $timestamp
+                ActivityType = $ActivityType
+                Username     = $Username
+                IPAddress    = $IPAddress
+                Hostname     = $Hostname
+                Details      = $Details
+                Status       = $Status
+            } | ConvertTo-Json -Compress
+            
+            Add-Content -Path $activityLogFile -Value $logEntry -Encoding UTF8 -ErrorAction SilentlyContinue
+            
+            # Portal status log for LOGIN/LOGOUT tracking
+            if ($ActivityType -in @("LOGIN", "LOGOUT", "LOGIN_FAILED", "LOGIN_BLOCKED")) {
+                $statusLogFile = Join-Path $PortalStatusPath "Portal_Status_$dateForFile.log"
+                $statusEntry = "[$timestamp] [$ActivityType] User: $Username | IP: $IPAddress | Status: $Status"
                 
-                if (!proc.HasExited)
-                {
-                    try { proc.Kill(); } catch { }
-                    LogActivity("LAPS_QUERY_TIMEOUT", GetSessionUser(sessionId), clientIp, "Query timeout for: " + hostname, "FAILED", hostname);
-                    SendHtml(res, BuildMainPage("Query timed out (30s). Check AD connectivity.", "error", hostname, GetSessionUser(sessionId), IsSessionAdmin(sessionId)), sessionId);
-                    return;
+                if ($ActivityType -eq "LOGIN") {
+                    $statusEntry += " | EVENT: Portal Opened and Active"
+                } elseif ($ActivityType -eq "LOGOUT") {
+                    $statusEntry += " | EVENT: Portal Closed/Logged Out"
                 }
-            }
-
-            if (exitCode != 0 && !string.IsNullOrEmpty(error))
-            {
-                string friendlyError = "LAPS query failed";
-                if (error.Contains("NotFound") || error.Contains("Cannot find"))
-                    friendlyError = "Computer not found or LAPS not configured";
-                else if (error.Contains("permission") || error.Contains("access"))
-                    friendlyError = "Permission denied. Verify your AD/LAPS permissions.";
-                else
-                    friendlyError = "Error: " + error.Trim();
-
-                LogActivity("LAPS_QUERY_FAILED", GetSessionUser(sessionId), clientIp, "Query error for " + hostname + ": " + error, "FAILED", hostname);
-                SendHtml(res, BuildMainPage(friendlyError, "error", hostname, GetSessionUser(sessionId), IsSessionAdmin(sessionId)), sessionId);
-                return;
-            }
-
-            Dictionary<string, string> dict = ParseSimpleJson(output);
-
-            if (dict.ContainsKey("Error"))
-            {
-                string errorMsg = dict["Error"];
-                if (errorMsg.Contains("NotFound") || errorMsg.Contains("Cannot find"))
-                    errorMsg = "Computer not found or LAPS not configured";
                 
-                LogActivity("LAPS_QUERY_FAILED", GetSessionUser(sessionId), clientIp, "Query failed for " + hostname + ": " + errorMsg, "FAILED", hostname);
-                SendHtml(res, BuildMainPage(errorMsg, "error", hostname, GetSessionUser(sessionId), IsSessionAdmin(sessionId)), sessionId);
-                return;
+                Add-Content -Path $statusLogFile -Value $statusEntry -Encoding UTF8 -ErrorAction SilentlyContinue
             }
-
-            string password = null;
-            string expiry = null;
-            string computerName = null;
-
-            dict.TryGetValue("ComputerName", out computerName);
-            dict.TryGetValue("Password", out password);
-            dict.TryGetValue("ExpirationTimestamp", out expiry);
-
-            if (string.IsNullOrEmpty(password))
-            {
-                LogActivity("LAPS_QUERY_FAILED", GetSessionUser(sessionId), clientIp, "No password returned for: " + hostname, "FAILED", hostname);
-                SendHtml(res, BuildMainPage("No LAPS password retrieved. Verify LAPS deployment.", "error", hostname, GetSessionUser(sessionId), IsSessionAdmin(sessionId)), sessionId);
-                return;
-            }
-
-            LogActivity("LAPS_QUERY_SUCCESS", GetSessionUser(sessionId), clientIp, "Password retrieved for: " + (computerName ?? hostname), "SUCCESS", (computerName ?? hostname));
-
-            string expiryDisplay = "N/A";
-            if (!string.IsNullOrEmpty(expiry))
-            {
-                DateTime dt;
-                if (DateTime.TryParse(expiry, out dt))
-                {
-                    double daysRemaining = (dt - DateTime.Now).TotalDays;
-                    string colorClass = "expiry-ok";
-                    if (daysRemaining < 1) colorClass = "expiry-critical";
-                    else if (daysRemaining < 7) colorClass = "expiry-warning";
-                    
-                    expiryDisplay = "<span class='" + colorClass + "'>" + dt.ToString("yyyy-MM-dd HH:mm") + " (" + daysRemaining.ToString("F1") + " days)</span>";
-                }
-                else
-                {
-                    expiryDisplay = SafeHtmlEncode(expiry);
-                }
-            }
-
-            SendHtml(res, BuildResultPage(computerName ?? hostname, password, expiryDisplay, GetSessionUser(sessionId), IsSessionAdmin(sessionId)), sessionId);
+            
+            Write-Host "[ACTIVITY] [$timestamp] [$ActivityType] User: $Username | IP: $IPAddress | Status: $Status | Details: $Details" -ForegroundColor Cyan
+        } finally {
+            [System.Threading.Monitor]::Exit($Global:LogLock)
         }
-        catch (Exception ex)
-        {
-            try
-            {
-                LogActivity("LAPS_QUERY_ERROR", GetSessionUser(sessionId), clientIp, "Exception: " + ex.Message, "ERROR", hostname);
-                SendHtml(res, BuildMainPage("An error occurred during query", "error", hostname, GetSessionUser(sessionId), IsSessionAdmin(sessionId)), sessionId);
-            }
-            catch { }
-        }
+    } catch {
+        # Silent fail for logging
     }
+}
 
-    private string CreateSession(string username, bool isAdmin, string ipAddress)
-    {
-        string sessionId = GenerateSessionId();
-        lock (sessions)
-        {
-            sessions[sessionId] = new SessionData { User = username, IsAdmin = isAdmin, LoginTime = DateTime.Now, IPAddress = ipAddress };
-        }
-        return sessionId;
+# ==================== AUTHENTICATION ====================
+function IsUserAuthorized {
+    param([string]$Username)
+    
+    [System.Threading.Monitor]::Enter($Global:AuthorizedUsers)
+    try {
+        return $Global:AuthorizedUsers.ContainsKey($Username.ToUpper())
+    } finally {
+        [System.Threading.Monitor]::Exit($Global:AuthorizedUsers)
     }
+}
 
-    private bool IsSessionValid(string sessionId)
-    {
-        if (string.IsNullOrEmpty(sessionId)) return false;
-        lock (sessions)
-        {
-            return sessions.ContainsKey(sessionId);
-        }
-    }
-
-    private string GetSessionUser(string sessionId)
-    {
-        if (string.IsNullOrEmpty(sessionId)) return "";
-        lock (sessions)
-        {
-            if (sessions.ContainsKey(sessionId))
-            {
-                return sessions[sessionId].User;
-            }
-        }
-        return "";
-    }
-
-    private bool IsSessionAdmin(string sessionId)
-    {
-        if (string.IsNullOrEmpty(sessionId)) return false;
-        lock (sessions)
-        {
-            if (sessions.ContainsKey(sessionId))
-            {
-                return sessions[sessionId].IsAdmin;
-            }
-        }
-        return false;
-    }
-
-    private bool IsUserAuthorized(string username)
-    {
-        lock (authorizedUsers)
-        {
-            return authorizedUsers.ContainsKey(username.ToUpper());
-        }
-    }
-
-    private bool AuthenticateWithDomain(string username, string password)
-    {
-        try
-        {
-            System.DirectoryServices.DirectoryEntry entry = new System.DirectoryServices.DirectoryEntry(
-                "LDAP://IDPBGTN.COM",
-                "IDPBGTN\\" + username,
-                password
-            );
-            object obj = entry.NativeObject;
-            entry.Dispose();
-            return true;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private string GenerateSessionId()
-    {
-        byte[] randomBytes = new byte[32];
-        using (var rng = new RNGCryptoServiceProvider())
-        {
-            rng.GetBytes(randomBytes);
-        }
-        return Convert.ToBase64String(randomBytes).Replace("+", "-").Replace("/", "_").Replace("=", "");
-    }
-
-    private string GetSessionCookie(HttpListenerRequest req)
-    {
-        try
-        {
-            if (req.Cookies != null)
-            {
-                Cookie sessionCookie = req.Cookies["LAPS_SESSION"];
-                if (sessionCookie != null)
-                {
-                    return sessionCookie.Value;
-                }
-            }
-        }
-        catch { }
-        return null;
-    }
-
-    private void ClearSessionCookie(HttpListenerResponse res)
-    {
-        Cookie cookie = new Cookie("LAPS_SESSION", "")
-        {
-            Expires = DateTime.Now.AddDays(-1),
-            Path = "/"
-        };
-        res.SetCookie(cookie);
-    }
-
-    private Dictionary<string, string> ParseFormData(string body)
-    {
-        Dictionary<string, string> result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        if (string.IsNullOrEmpty(body)) return result;
-
-        try
-        {
-            string[] pairs = body.Split('&');
-            foreach (string pair in pairs)
-            {
-                string[] kv = pair.Split(new char[] { '=' }, 2);
-                if (kv.Length == 2)
-                    result[System.Web.HttpUtility.UrlDecode(kv[0])] = System.Web.HttpUtility.UrlDecode(kv[1]);
-            }
-        }
-        catch { }
-        return result;
-    }
-
-    private Dictionary<string, string> ParseSimpleJson(string json)
-    {
-        Dictionary<string, string> result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        if (string.IsNullOrWhiteSpace(json)) return result;
+function AuthenticateWithDomain {
+    param([string]$Username, [string]$Password)
+    
+    try {
+        [System.DirectoryServices.DirectoryEntry]$entry = New-Object System.DirectoryServices.DirectoryEntry(
+            "LDAP://IDPBGTN.COM",
+            "IDPBGTN\$Username",
+            $Password
+        )
         
-        try
-        {
-            JavaScriptSerializer serializer = new JavaScriptSerializer();
-            var dict = serializer.Deserialize<Dictionary<string, object>>(json);
-            if (dict != null)
-            {
-                foreach (var kvp in dict)
-                {
-                    result[kvp.Key] = kvp.Value != null ? kvp.Value.ToString() : "";
-                }
+        # Force authentication
+        $null = $entry.NativeObject
+        $entry.Dispose()
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+# ==================== UTILITY FUNCTIONS ====================
+function SafeHtmlEncode {
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return $Text }
+    return $Text -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;'
+}
+
+function ParseFormData {
+    param([string]$Body)
+    
+    $result = @{}
+    if ([string]::IsNullOrEmpty($Body)) { return $result }
+    
+    try {
+        $pairs = $Body -split '&'
+        foreach ($pair in $pairs) {
+            $kv = $pair -split '=', 2
+            if ($kv.Count -eq 2) {
+                $key = [System.Web.HttpUtility]::UrlDecode($kv[0])
+                $value = [System.Web.HttpUtility]::UrlDecode($kv[1])
+                $result[$key] = $value
             }
         }
-        catch { }
+    } catch { }
+    
+    return $result
+}
 
-        return result;
+function ParseCookies {
+    param([string]$CookieHeader)
+    
+    $result = @{}
+    if ([string]::IsNullOrEmpty($CookieHeader)) { return $result }
+    
+    $cookies = $CookieHeader -split '; '
+    foreach ($cookie in $cookies) {
+        $parts = $cookie -split '=', 2
+        if ($parts.Count -eq 2) {
+            $result[$parts[0].Trim()] = $parts[1].Trim()
+        }
     }
+    
+    return $result
+}
 
-    private void SendHtml(HttpListenerResponse res, string html, string sessionId)
-    {
-        try
-        {
-            byte[] buffer = Encoding.UTF8.GetBytes(html);
-            res.ContentType = "text/html; charset=utf-8";
-            res.ContentLength64 = buffer.Length;
-
-            if (!string.IsNullOrEmpty(sessionId))
-            {
-                Cookie cookie = new Cookie("LAPS_SESSION", sessionId)
-                {
-                    Path = "/",
-                    HttpOnly = true,
-                    Secure = false
-                };
-                res.SetCookie(cookie);
+function GetSessionCookie {
+    param([System.Net.HttpListenerRequest]$Request)
+    
+    try {
+        $cookieHeader = $Request.Headers["Cookie"]
+        if (-not [string]::IsNullOrEmpty($cookieHeader)) {
+            $cookies = ParseCookies $cookieHeader
+            if ($cookies.ContainsKey("LAPS_SESSION")) {
+                return $cookies["LAPS_SESSION"]
             }
-
-            res.OutputStream.Write(buffer, 0, buffer.Length);
         }
-        catch { }
+    } catch { }
+    
+    return $null
+}
+
+# ==================== HTML PAGE BUILDERS ====================
+function BuildLoginPage {
+    param([string]$Message)
+    
+    $messageHtml = ""
+    if (-not [string]::IsNullOrEmpty($Message)) {
+        $msgClass = if ($Message -like "*successfully*") { "alert-success" } else { "alert-error" }
+        $messageHtml = "<div class='alert $msgClass'>$(SafeHtmlEncode $Message)</div>"
     }
-
-    private void SendJson(HttpListenerResponse res, object data)
-    {
-        try
-        {
-            JavaScriptSerializer serializer = new JavaScriptSerializer();
-            string json = serializer.Serialize(data);
-            byte[] buffer = Encoding.UTF8.GetBytes(json);
-            res.ContentType = "application/json; charset=utf-8";
-            res.ContentLength64 = buffer.Length;
-            res.OutputStream.Write(buffer, 0, buffer.Length);
-        }
-        catch { }
-    }
-
-    private string SafeHtmlEncode(string s)
-    {
-        if (string.IsNullOrEmpty(s)) return s;
-        return s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;").Replace("\"", "&quot;");
-    }
-
-    private string SafeHtmlAttributeEncode(string s)
-    {
-        if (string.IsNullOrEmpty(s)) return s;
-        return s.Replace("&", "&amp;").Replace("\"", "&quot;");
-    }
-
-    private string BuildLoginPage(string message)
-    {
-        string messageHtml = "";
-        if (!string.IsNullOrEmpty(message))
-        {
-            string msgClass = message.Contains("successfully") ? "alert-success" : "alert-error";
-            messageHtml = "<div class='alert " + msgClass + "'>" + SafeHtmlEncode(message) + "</div>";
-        }
-
-        string body = @"
+    
+    $body = @"
 <div class='card'>
-    <div class='card-header'>
+    <div class='card-header text-center'>
         <h1>LAPS Password Portal</h1>
         <p>Secure Access to Local Administrator Passwords</p>
     </div>
-    " + messageHtml + @"
+    $messageHtml
     <form method='POST' action='/login'>
         <div class='form-group'>
             <label for='username'>Username</label>
-            <input type='text' id='username' name='username' placeholder='domain EMP ID' required autofocus>
+            <input type='text' id='username' name='username' style='text-transform:uppercase;' placeholder='domain EMP ID' required autofocus>
             <small class='help-hint'>User: Use your domain EMP ID</small>
         </div>
         <div class='form-group'>
@@ -1031,28 +431,35 @@ public class LapsWebServer
         </div>
         <button type='submit' class='btn btn-primary'>Login</button>
     </form>
-</div>";
+</div>
+"@
+    
+    return GetPageTemplate $body
+}
 
-        return GetPageTemplate(body);
+function BuildMainPage {
+    param(
+        [string]$Message,
+        [string]$MessageType,
+        [string]$PrefillHostname,
+        [string]$Username,
+        [string]$UserDisplayName,
+        [bool]$IsAdmin
+    )
+    
+    $statusHtml = ""
+    if (-not [string]::IsNullOrEmpty($Message)) {
+        $statusHtml = "<div class='alert alert-$MessageType'>$(SafeHtmlEncode $Message)</div>"
     }
-
-    private string BuildMainPage(string message, string messageType, string prefillHostname, string username, bool isAdmin)
-    {
-        string statusHtml = "";
-        if (!string.IsNullOrEmpty(message))
-        {
-            statusHtml = "<div class='alert alert-" + messageType + "'>" + SafeHtmlEncode(message) + "</div>";
-        }
-
-        string hostValue = "";
-        if (!string.IsNullOrEmpty(prefillHostname))
-        {
-            hostValue = " value='" + SafeHtmlAttributeEncode(prefillHostname) + "'";
-        }
-
-        string adminLink = isAdmin ? "<a href='/admin' class='btn btn-secondary btn-small'>Settings</a>" : "";
-
-        string body = @"
+    
+    $hostValue = ""
+    if (-not [string]::IsNullOrEmpty($PrefillHostname)) {
+        $hostValue = " value='$(SafeHtmlEncode $PrefillHostname)'"
+    }
+    
+    $adminLink = if ($IsAdmin) { "<a href='/admin' class='btn btn-secondary btn-small'>Settings</a>" } else { "" }
+    
+    $body = @"
 <div class='card'>
     <div class='card-header'>
         <div class='header-top'>
@@ -1061,19 +468,19 @@ public class LapsWebServer
                 <p>Enter computer hostname to retrieve local administrator password</p>
             </div>
             <div class='user-section'>
-                <div>User: <span class='user-name'>" + SafeHtmlEncode(username) + @"</span></div>
+                <div>User: <span class='user-name'>$(SafeHtmlEncode $UserDisplayName)</span></div>
                 <div class='button-group'>
                     <a href='/logout-page' class='btn btn-secondary btn-small'>Logout</a>
-                    " + adminLink + @"
+                    $adminLink
                 </div>
             </div>
         </div>
     </div>
-    " + statusHtml + @"
+    $statusHtml
     <form method='POST' action='/get-laps' id='lapsForm'>
         <div class='form-group'>
             <label for='hostname'>Computer Hostname</label>
-            <input type='text' id='hostname' name='hostname' placeholder='WKSTN-IT-001.idpbgtn.com' required autofocus autocomplete='off'" + hostValue + @">
+            <input type='text' id='hostname' name='hostname' style='text-transform:uppercase;' placeholder='WKSTN-IT-001.idpbgtn.com' required autofocus autocomplete='off'$hostValue>
         </div>
         <button type='submit' class='btn btn-primary'>
             <span class='btn-text'>Retrieve Password</span>
@@ -1089,16 +496,25 @@ document.getElementById('lapsForm').addEventListener('submit', function(e) {
     btn.querySelector('.btn-text').style.display = 'none'; 
     btn.querySelector('.btn-loader').style.display = 'inline'; 
 });
-</script>";
-        
-        return GetPageTemplate(body);
-    }
+</script>
+"@
+    
+    return GetPageTemplate $body
+}
 
-    private string BuildResultPage(string computer, string password, string expiryHtml, string username, bool isAdmin)
-    {
-        string adminLink = isAdmin ? "<a href='/admin' class='btn btn-secondary' style='margin: 0 6px;'>Settings</a>" : "";
-
-        string body = @"
+function BuildResultPage {
+    param(
+        [string]$Computer,
+        [string]$Password,
+        [string]$ExpiryHtml,
+        [string]$Username,
+        [string]$UserDisplayName,
+        [bool]$IsAdmin
+    )
+    
+    $adminLink = if ($IsAdmin) { "<a href='/admin' class='btn btn-secondary' style='margin: 0 6px;'>Settings</a>" } else { "" }
+    
+    $body = @"
 <div class='card'>
     <div class='card-header'>
         <div class='header-top'>
@@ -1106,7 +522,7 @@ document.getElementById('lapsForm').addEventListener('submit', function(e) {
                 <h1>Password Retrieved</h1>
             </div>
             <div class='user-section'>
-                <div>User: <span class='user-name'>" + SafeHtmlEncode(username) + @"</span></div>
+                <div>User: <span class='user-name'>$(SafeHtmlEncode $UserDisplayName)</span></div>
                 <div class='button-group'>
                     <a href='/logout-page' class='btn btn-secondary btn-small'>Logout</a>
                 </div>
@@ -1116,24 +532,24 @@ document.getElementById('lapsForm').addEventListener('submit', function(e) {
     <div class='result-grid'>
         <div class='result-item'>
             <span class='result-label'>Computer</span>
-            <span class='result-value'>" + SafeHtmlEncode(computer) + @"</span>
+            <span class='result-value'>$(SafeHtmlEncode $Computer)</span>
         </div>
         <div class='result-item'>
             <span class='result-label'>Password</span>
             <div class='password-container'>
-                <span id='pwd' class='password-blur' onclick='toggleReveal()'>" + SafeHtmlEncode(password) + @"</span>
+                <span id='pwd' class='password-blur' onclick='toggleReveal()'>$(SafeHtmlEncode $Password)</span>
                 <button type='button' class='btn btn-small btn-secondary' onclick='copyPassword()' id='copyBtn'>Copy</button>
             </div>
             <small class='hint'>Click password to reveal, Click Copy to copy</small>
         </div>
         <div class='result-item'>
             <span class='result-label'>Expiration</span>
-            <span class='result-value'>" + expiryHtml + @"</span>
+            <span class='result-value'>$ExpiryHtml</span>
         </div>
     </div>
     <div class='actions'>
         <a href='/' class='btn btn-secondary'>Query Another</a>
-        " + adminLink + @"
+        $adminLink
     </div>
 </div>
 <script>
@@ -1176,22 +592,27 @@ function fallbackCopy(text, btn, originalText) {
     }
     document.body.removeChild(textarea);
 }
-</script>";
-        
-        return GetPageTemplate(body);
+</script>
+"@
+    
+    return GetPageTemplate $body
+}
+
+function BuildAdminPage {
+    param(
+        [string]$Message,
+        [string]$Username,
+        [string]$UserDisplayName
+    )
+    
+    $messageHtml = ""
+    if (-not [string]::IsNullOrEmpty($Message)) {
+        $msgClass = if ($Message -like "*successfully*") { "alert-success" } else { "alert-error" }
+        $messageHtml = "<div class='alert $msgClass'>$(SafeHtmlEncode $Message)</div>"
     }
-
-    private string BuildAdminPage(string message, string username)
-    {
-        string messageHtml = "";
-        if (!string.IsNullOrEmpty(message))
-        {
-            string msgClass = message.Contains("successfully") ? "alert-success" : "alert-error";
-            messageHtml = "<div class='alert " + msgClass + "'>" + SafeHtmlEncode(message) + "</div>";
-        }
-
-        string body = @"
-<div class='card' style='max-width: 600px;'>
+    
+    $body = @"
+<div class='card' style='max-width: 700px;'>
     <div class='card-header'>
         <div class='header-top'>
             <div>
@@ -1199,7 +620,7 @@ function fallbackCopy(text, btn, originalText) {
                 <p>Manage authorized users</p>
             </div>
             <div class='user-section'>
-                <div>Admin: <span class='user-name'>" + SafeHtmlEncode(username) + @"</span></div>
+                <div>Admin: <span class='user-name'>$(SafeHtmlEncode $UserDisplayName)</span></div>
                 <div class='button-group'>
                     <a href='/' class='btn btn-secondary btn-small'>Back</a>
                     <a href='/logout-page' class='btn btn-secondary btn-small'>Logout</a>
@@ -1207,7 +628,7 @@ function fallbackCopy(text, btn, originalText) {
             </div>
         </div>
     </div>
-    " + messageHtml + @"
+    $messageHtml
     <div class='admin-section'>
         <div class='admin-subsection'>
             <h2>Add Domain User</h2>
@@ -1215,13 +636,21 @@ function fallbackCopy(text, btn, originalText) {
                 <div class='form-group'>
                     <label for='new_username'>Domain Username</label>
                     <input type='text' id='new_username' name='new_username' placeholder='john.doe' required autocomplete='off'>
-                    <small class='help-hint'>User will be able to login with their domain password</small>
+                    <small class='help-hint'>User's domain login ID</small>
+                </div>
+                <div class='form-group'>
+                    <label for='new_user_name'>Full Name</label>
+                    <input type='text' id='new_user_name' name='new_user_name' placeholder='John Doe' required autocomplete='off'>
+                    <small class='help-hint'>User's display name</small>
                 </div>
                 <button type='submit' class='btn btn-primary btn-small'>Add User</button>
             </form>
         </div>
         <div class='admin-subsection'>
             <h2>Authorized Users</h2>
+            <div class='search-box'>
+                <input type='text' id='searchUsers' placeholder='Search users...' autocomplete='off'>
+            </div>
             <div id='usersList' class='users-list'>
                 <p>Loading...</p>
             </div>
@@ -1229,26 +658,56 @@ function fallbackCopy(text, btn, originalText) {
     </div>
 </div>
 <script>
+var allUsers = [];
+
 function loadUsers() {
     fetch('/admin/get-users')
         .then(function(r) { return r.json(); })
         .then(function(data) {
-            var html = '';
-            if (data.users && data.users.length > 0) {
-                data.users.forEach(function(u) {
-                    var isAdmin = u.username === 'ADMIN' ? ' (Built-in)' : '';
-                    html += '<div class=user-item><span>' + u.username + isAdmin + '</span>';
-                    if (u.username !== 'ADMIN') {
-                        html += '<button type=button class=btn onclick=removeUser(""' + u.username + '"")>Remove</button>';
-                    }
-                    html += '</div>';
-                });
-            } else {
-                html = '<p>No users found</p>';
-            }
-            document.getElementById('usersList').innerHTML = html;
+            allUsers = data.users || [];
+            renderUsers(allUsers);
         });
 }
+
+function renderUsers(users) {
+    var html = '';
+    if (users && users.length > 0) {
+        users.forEach(function(u) {
+            var isAdmin = u.username === 'ADMIN' ? ' (Built-in)' : '';
+            var displayName = u.name || u.username;
+            html += '<div class=user-item>';
+            html += '<div class=user-info>';
+            html += '<div class=username>' + SafeHtmlEncode(u.username) + '</div>';
+            html += '<div class=username-display>' + SafeHtmlEncode(displayName) + isAdmin + '</div>';
+            html += '</div>';
+            if (u.username !== 'ADMIN') {
+                html += '<button type=button class=btn class=btn-remove onclick=removeUser(\"' + u.username + '\")>Remove</button>';
+            }
+            html += '</div>';
+        });
+    } else {
+        html = '<p>No users found</p>';
+    }
+    document.getElementById('usersList').innerHTML = html;
+}
+
+function SafeHtmlEncode(s) {
+    if (!s) return '';
+    var div = document.createElement('div');
+    div.textContent = s;
+    return div.innerHTML;
+}
+
+function filterUsers() {
+    var searchTerm = document.getElementById('searchUsers').value.toLowerCase();
+    var filtered = allUsers.filter(function(u) {
+        return (u.username.toLowerCase().indexOf(searchTerm) > -1 || 
+                (u.name && u.name.toLowerCase().indexOf(searchTerm) > -1));
+    });
+    renderUsers(filtered);
+}
+
+document.getElementById('searchUsers').addEventListener('keyup', filterUsers);
 
 function removeUser(username) {
     if (!confirm('Remove user ' + username + '?')) return;
@@ -1260,35 +719,42 @@ function removeUser(username) {
     .then(function(data) {
         alert(data.message);
         loadUsers();
+        document.getElementById('searchUsers').value = '';
     });
 }
 
 document.getElementById('addUserForm').addEventListener('submit', function(e) {
     e.preventDefault();
     var username = document.getElementById('new_username').value;
+    var userName = document.getElementById('new_user_name').value;
     fetch('/admin/add-user', {
         method: 'POST',
-        body: 'new_username=' + encodeURIComponent(username)
+        body: 'new_username=' + encodeURIComponent(username) + '&new_user_name=' + encodeURIComponent(userName)
     })
     .then(function(r) { return r.json(); })
     .then(function(data) {
         alert(data.message);
         if (data.success) {
             document.getElementById('new_username').value = '';
+            document.getElementById('new_user_name').value = '';
             loadUsers();
+            document.getElementById('searchUsers').value = '';
         }
     });
 });
 
 loadUsers();
-</script>";
+</script>
+"@
+    
+    return GetPageTemplate $body
+}
 
-        return GetPageTemplate(body);
-    }
-
-    private string GetPageTemplate(string bodyContent)
-    {
-        return @"<!DOCTYPE html>
+function GetPageTemplate {
+    param([string]$BodyContent)
+    
+    return @"
+<!DOCTYPE html>
 <html lang='en'>
 <head>
     <meta charset='UTF-8'>
@@ -1299,6 +765,8 @@ loadUsers();
         body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
         .card { background: white; border-radius: 16px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); width: 100%; max-width: 480px; overflow: hidden; }
         .card-header { background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); color: white; padding: 28px; }
+        .card-header.text-center { text-align: center; }
+        .card-header.text-center h1 { margin-bottom: 8px; }
         .header-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; }
         .card-header h1 { font-size: 1.5rem; font-weight: 600; margin-bottom: 6px; }
         .card-header p { opacity: 0.9; font-size: 0.875rem; }
@@ -1322,6 +790,8 @@ loadUsers();
         .btn-secondary { background: #f3f4f6; color: #374151; border: none; }
         .btn-secondary:hover { background: #e5e7eb; }
         .btn-small { padding: 6px 12px; font-size: 0.875rem; width: auto; }
+        .btn-remove { padding: 6px 12px; font-size: 0.875rem; width: auto; background: #fee2e2; color: #991b1b; border: none; }
+        .btn-remove:hover { background: #fecaca; }
         .btn.copied { background: linear-gradient(90deg, #10b981 0%, #059669 100%); color: white; }
         .help-text { margin-top: 20px; padding-top: 20px; border-top: 1px solid #e5e7eb; font-size: 0.875rem; color: #6b7280; }
         .result-grid { display: flex; flex-direction: column; gap: 20px; }
@@ -1341,36 +811,453 @@ loadUsers();
         .admin-section { display: flex; flex-direction: column; gap: 30px; }
         .admin-subsection { padding: 20px; background: #f9fafb; border-radius: 8px; }
         .admin-subsection h2 { font-size: 1.125rem; margin-bottom: 16px; color: #111827; }
-        .users-list { display: flex; flex-direction: column; gap: 10px; }
+        .search-box { margin-bottom: 16px; }
+        .search-box input { width: 100%; padding: 10px 14px; border: 2px solid #e5e7eb; border-radius: 6px; font-size: 0.95rem; }
+        .search-box input:focus { outline: none; border-color: #667eea; box-shadow: 0 0 0 3px rgba(102,126,234,0.1); }
+        .users-list { display: flex; flex-direction: column; gap: 10px; max-height: 400px; overflow-y: auto; padding-right: 8px; }
+        .users-list::-webkit-scrollbar { width: 8px; }
+        .users-list::-webkit-scrollbar-track { background: #f1f1f1; border-radius: 10px; }
+        .users-list::-webkit-scrollbar-thumb { background: #888; border-radius: 10px; }
+        .users-list::-webkit-scrollbar-thumb:hover { background: #555; }
         .user-item { display: flex; justify-content: space-between; align-items: center; padding: 12px; background: white; border-radius: 6px; border: 1px solid #e5e7eb; }
-        .user-item span { font-weight: 500; color: #374151; }
+        .user-info { flex: 1; min-width: 0; }
+        .username { font-weight: 600; color: #374151; font-size: 0.95rem; }
+        .username-display { font-size: 0.85rem; color: #6b7280; margin-top: 2px; }
         @media (max-width: 600px) {
             .header-top { flex-direction: column; }
             .user-section { text-align: left; }
             .button-group { justify-content: flex-start; }
+            .card { max-width: 100%; }
         }
     </style>
 </head>
-<body>" + bodyContent + @"</body></html>";
+<body>
+    $BodyContent
+</body>
+</html>
+"@
+}
+
+# ==================== REQUEST HANDLERS ====================
+function HandleLogin {
+    param(
+        [System.Net.HttpListenerRequest]$Request,
+        [System.Net.HttpListenerResponse]$Response,
+        [string]$ClientIP
+    )
+    
+    try {
+        if (IsIPLocked $ClientIP) {
+            LogActivity "LOGIN_BLOCKED" "Unknown" $ClientIP "IP blocked due to multiple failed attempts" "BLOCKED"
+            $html = BuildLoginPage "Too many failed login attempts. Please try again in 15 minutes."
+            SendHtml $Response $html $null
+            return
+        }
+        
+        $body = $null
+        if ($Request.ContentLength64 -gt 0) {
+            $reader = New-Object System.IO.StreamReader($Request.InputStream, $Request.ContentEncoding)
+            $body = $reader.ReadToEnd()
+            $reader.Close()
+        }
+        
+        $formData = ParseFormData $body
+        $username = if ($formData["username"]) { $formData["username"] } else { "" }
+        $username = $username.Trim()
+        $password = if ($formData["password"]) { $formData["password"] } else { "" }
+        $password = $password.Trim()
+        
+        if ([string]::IsNullOrEmpty($username) -or [string]::IsNullOrEmpty($password)) {
+            RecordFailedLogin $ClientIP
+            LogActivity "LOGIN_FAILED" "Unknown" $ClientIP "Empty username or password" "FAILED"
+            $html = BuildLoginPage "Invalid credentials"
+            SendHtml $Response $html $null
+            return
+        }
+        
+        $authSuccess = $false
+        $isAdmin = $false
+        $userDisplayName = ""
+        
+        # Check admin hardcoded credentials
+        if ($username -eq "HH0010520" -and $password -eq "nkg@12345.") {
+            $authSuccess = $true
+            $isAdmin = $true
+            $userDisplayName = "Administrator"
+            ClearFailedLogins $ClientIP
+            LogActivity "LOGIN" $username $ClientIP "Admin login successful" "SUCCESS"
+        }
+        # Check authorized domain user
+        elseif (IsUserAuthorized $username) {
+            if (AuthenticateWithDomain $username $password) {
+                $authSuccess = $true
+                $isAdmin = $false
+                
+                [System.Threading.Monitor]::Enter($Global:AuthorizedUsers)
+                try {
+                    if ($Global:AuthorizedUsers.ContainsKey($username.ToUpper())) {
+                        $userDisplayName = $Global:AuthorizedUsers[$username.ToUpper()].name
+                    } else {
+                        $userDisplayName = $username
+                    }
+                } finally {
+                    [System.Threading.Monitor]::Exit($Global:AuthorizedUsers)
+                }
+                
+                ClearFailedLogins $ClientIP
+                LogActivity "LOGIN" $username $ClientIP "Domain user login successful" "SUCCESS"
+            } else {
+                RecordFailedLogin $ClientIP
+                LogActivity "LOGIN_FAILED" $username $ClientIP "Invalid domain credentials" "FAILED"
+                $html = BuildLoginPage "Invalid credentials"
+                SendHtml $Response $html $null
+                return
+            }
+        } else {
+            RecordFailedLogin $ClientIP
+            LogActivity "LOGIN_FAILED" $username $ClientIP "Unauthorized user attempted login" "FAILED"
+            $html = BuildLoginPage "Invalid credentials"
+            SendHtml $Response $html $null
+            return
+        }
+        
+        if (-not $authSuccess) {
+            RecordFailedLogin $ClientIP
+            LogActivity "LOGIN_FAILED" $username $ClientIP "Authentication failed" "FAILED"
+            $html = BuildLoginPage "Invalid credentials"
+            SendHtml $Response $html $null
+            return
+        }
+        
+        $sessionId = CreateSession $username $userDisplayName $isAdmin $ClientIP
+        $html = BuildMainPage $null $null $null $username $userDisplayName $isAdmin
+        SendHtml $Response $html $sessionId
+    } catch {
+        RecordFailedLogin $ClientIP
+        LogActivity "LOGIN_ERROR" "Unknown" $ClientIP "Request parsing error: $_" "ERROR"
+        $html = BuildLoginPage "Request error"
+        SendHtml $Response $html $null
     }
 }
-'@
+
+function HandleLapsQuery {
+    param(
+        [System.Net.HttpListenerRequest]$Request,
+        [System.Net.HttpListenerResponse]$Response,
+        [string]$SessionId,
+        [string]$ClientIP
+    )
+    
+    try {
+        $body = $null
+        if ($Request.ContentLength64 -gt 0) {
+            $reader = New-Object System.IO.StreamReader($Request.InputStream, $Request.ContentEncoding)
+            $body = $reader.ReadToEnd()
+            $reader.Close()
+        }
+        
+        $formData = ParseFormData $body
+        $hostname = if ($formData["hostname"]) { $formData["hostname"] } else { "" }
+        $hostname = $hostname.Trim()
+        
+        $username = GetSessionUser $SessionId
+        $userDisplayName = GetSessionUserName $SessionId
+        $isAdmin = IsSessionAdmin $SessionId
+        
+        if ([string]::IsNullOrEmpty($hostname)) {
+            LogActivity "LAPS_QUERY_FAILED" $username $ClientIP "Empty hostname" "FAILED" $hostname
+            $html = BuildMainPage "Hostname is required" "error" $null $username $userDisplayName $isAdmin
+            SendHtml $Response $html $SessionId
+            return
+        }
+        
+        if ($hostname.Length -gt 63 -or $hostname -notmatch "^[a-zA-Z0-9\-\.]+$") {
+            LogActivity "LAPS_QUERY_FAILED" $username $ClientIP "Invalid hostname format: $hostname" "FAILED" $hostname
+            $html = BuildMainPage "Invalid hostname format" "error" $null $username $userDisplayName $isAdmin
+            SendHtml $Response $html $SessionId
+            return
+        }
+        
+        try {
+            $result = Get-LapsADPassword -Identity $hostname -AsPlainText -ErrorAction Stop
+            
+            $computerName = if ($result.ComputerName) { $result.ComputerName } else { $hostname }
+            $password = $result.Password
+            $expiration = $result.ExpirationTimestamp
+            
+            if ([string]::IsNullOrEmpty($password)) {
+                LogActivity "LAPS_QUERY_FAILED" $username $ClientIP "No password returned for: $hostname" "FAILED" $hostname
+                $html = BuildMainPage "No LAPS password retrieved. Verify LAPS deployment." "error" $hostname $username $userDisplayName $isAdmin
+                SendHtml $Response $html $SessionId
+                return
+            }
+            
+            LogActivity "LAPS_QUERY_SUCCESS" $username $ClientIP "Password retrieved for: $computerName" "SUCCESS" $computerName
+            
+            $expiryDisplay = "N/A"
+            if (-not [string]::IsNullOrEmpty($expiration)) {
+                try {
+                    $dt = [DateTime]::Parse($expiration)
+                    $daysRemaining = ($dt - (Get-Date)).TotalDays
+                    
+                    if ($daysRemaining -lt 1) {
+                        $colorClass = "expiry-critical"
+                    } elseif ($daysRemaining -lt 7) {
+                        $colorClass = "expiry-warning"
+                    } else {
+                        $colorClass = "expiry-ok"
+                    }
+                    
+                    $expiryDisplay = "<span class='$colorClass'>$($dt.ToString('yyyy-MM-dd HH:mm')) ($([Math]::Round($daysRemaining, 1)) days)</span>"
+                } catch {
+                    $expiryDisplay = SafeHtmlEncode $expiration
+                }
+            }
+            
+            $html = BuildResultPage $computerName $password $expiryDisplay $username $userDisplayName $isAdmin
+            SendHtml $Response $html $SessionId
+        } catch {
+            $errorMsg = "LAPS query failed"
+            if ($_.Exception.Message -match "NotFound|Cannot find") {
+                $errorMsg = "Computer not found or LAPS not configured"
+            } elseif ($_.Exception.Message -match "permission|access") {
+                $errorMsg = "Permission denied. Verify your AD/LAPS permissions."
+            } else {
+                $errorMsg = "Error: $($_.Exception.Message)"
+            }
+            
+            LogActivity "LAPS_QUERY_FAILED" $username $ClientIP "Query error for $hostname : $($_.Exception.Message)" "FAILED" $hostname
+            $html = BuildMainPage $errorMsg "error" $hostname $username $userDisplayName $isAdmin
+            SendHtml $Response $html $SessionId
+        }
+    } catch {
+        $username = GetSessionUser $SessionId
+        $userDisplayName = GetSessionUserName $SessionId
+        $isAdmin = IsSessionAdmin $SessionId
+        
+        LogActivity "LAPS_QUERY_ERROR" $username $ClientIP "Exception: $_" "ERROR" ""
+        $html = BuildMainPage "An error occurred during query" "error" "" $username $userDisplayName $isAdmin
+        SendHtml $Response $html $SessionId
+    }
+}
+
+function HandleAddUser {
+    param(
+        [System.Net.HttpListenerRequest]$Request,
+        [System.Net.HttpListenerResponse]$Response,
+        [string]$SessionId,
+        [string]$ClientIP
+    )
+    
+    try {
+        $body = $null
+        if ($Request.ContentLength64 -gt 0) {
+            $reader = New-Object System.IO.StreamReader($Request.InputStream, $Request.ContentEncoding)
+            $body = $reader.ReadToEnd()
+            $reader.Close()
+        }
+        
+        $formData = ParseFormData $body
+        $newUsername = if ($formData["new_username"]) { $formData["new_username"] } else { "" }
+        $newUsername = $newUsername.Trim().ToUpper()
+        $newUserDisplayName = if ($formData["new_user_name"]) { $formData["new_user_name"] } else { "" }
+        $newUserDisplayName = $newUserDisplayName.Trim()
+        
+        $admin = GetSessionUser $SessionId
+        
+        if ([string]::IsNullOrEmpty($newUsername)) {
+            LogActivity "ADD_USER_FAILED" $admin $ClientIP "Empty username" "FAILED"
+            $json = @{ success = $false; message = "Username required" } | ConvertTo-Json
+            SendJson $Response $json
+            return
+        }
+        
+        if ([string]::IsNullOrEmpty($newUserDisplayName)) {
+            LogActivity "ADD_USER_FAILED" $admin $ClientIP "Empty user name" "FAILED"
+            $json = @{ success = $false; message = "User name required" } | ConvertTo-Json
+            SendJson $Response $json
+            return
+        }
+        
+        if ($newUsername.Length -gt 20 -or $newUsername -notmatch "^[a-zA-Z0-9\-\.]+$") {
+            LogActivity "ADD_USER_FAILED" $admin $ClientIP "Invalid username format: $newUsername" "FAILED"
+            $json = @{ success = $false; message = "Invalid username format" } | ConvertTo-Json
+            SendJson $Response $json
+            return
+        }
+        
+        [System.Threading.Monitor]::Enter($Global:AuthorizedUsers)
+        try {
+            if ($Global:AuthorizedUsers.ContainsKey($newUsername)) {
+                LogActivity "ADD_USER_FAILED" $admin $ClientIP "User already exists: $newUsername" "FAILED"
+                $json = @{ success = $false; message = "User already authorized" } | ConvertTo-Json
+                SendJson $Response $json
+                return
+            }
+            
+            $Global:AuthorizedUsers[$newUsername] = @{
+                username   = $newUsername
+                name       = $newUserDisplayName
+                authorized = $true
+                addedBy    = $admin
+                addedDate  = Get-Date
+            }
+        } finally {
+            [System.Threading.Monitor]::Exit($Global:AuthorizedUsers)
+        }
+        
+        SaveAuthorizedUsersToFile
+        LogActivity "ADD_USER" $admin $ClientIP "Added user: $newUsername" "SUCCESS"
+        $json = @{ success = $true; message = "User $newUsername added successfully" } | ConvertTo-Json
+        SendJson $Response $json
+    } catch {
+        $admin = GetSessionUser $SessionId
+        LogActivity "ADD_USER_ERROR" $admin $ClientIP "Exception: $_" "ERROR"
+        $json = @{ success = $false; message = "An error occurred" } | ConvertTo-Json
+        SendJson $Response $json
+    }
+}
+
+function HandleRemoveUser {
+    param(
+        [System.Net.HttpListenerRequest]$Request,
+        [System.Net.HttpListenerResponse]$Response,
+        [string]$SessionId,
+        [string]$ClientIP
+    )
+    
+    try {
+        $body = $null
+        if ($Request.ContentLength64 -gt 0) {
+            $reader = New-Object System.IO.StreamReader($Request.InputStream, $Request.ContentEncoding)
+            $body = $reader.ReadToEnd()
+            $reader.Close()
+        }
+        
+        $formData = ParseFormData $body
+        $username = if ($formData["username"]) { $formData["username"] } else { "" }
+        $username = $username.Trim().ToUpper()
+        $admin = GetSessionUser $SessionId
+        
+        if ($username -eq "ADMIN") {
+            LogActivity "REMOVE_USER_FAILED" $admin $ClientIP "Attempted to remove ADMIN" "FAILED"
+            $json = @{ success = $false; message = "Cannot remove ADMIN user" } | ConvertTo-Json
+            SendJson $Response $json
+            return
+        }
+        
+        [System.Threading.Monitor]::Enter($Global:AuthorizedUsers)
+        try {
+            if ($Global:AuthorizedUsers.ContainsKey($username)) {
+                $Global:AuthorizedUsers.Remove($username)
+                SaveAuthorizedUsersToFile
+                LogActivity "REMOVE_USER" $admin $ClientIP "Removed user: $username" "SUCCESS"
+                $json = @{ success = $true; message = "User $username removed successfully" } | ConvertTo-Json
+                SendJson $Response $json
+            } else {
+                LogActivity "REMOVE_USER_FAILED" $admin $ClientIP "User not found: $username" "FAILED"
+                $json = @{ success = $false; message = "User not found" } | ConvertTo-Json
+                SendJson $Response $json
+            }
+        } finally {
+            [System.Threading.Monitor]::Exit($Global:AuthorizedUsers)
+        }
+    } catch {
+        $admin = GetSessionUser $SessionId
+        LogActivity "REMOVE_USER_ERROR" $admin $ClientIP "Exception: $_" "ERROR"
+        $json = @{ success = $false; message = "An error occurred" } | ConvertTo-Json
+        SendJson $Response $json
+    }
+}
+
+function HandleGetUsers {
+    param([System.Net.HttpListenerResponse]$Response)
+    
+    try {
+        $users = @()
+        [System.Threading.Monitor]::Enter($Global:AuthorizedUsers)
+        try {
+            foreach ($kvp in $Global:AuthorizedUsers.GetEnumerator()) {
+                $users += @{
+                    username = $kvp.Value.username
+                    name     = $kvp.Value.name
+                }
+            }
+        } finally {
+            [System.Threading.Monitor]::Exit($Global:AuthorizedUsers)
+        }
+        
+        $json = @{ users = $users } | ConvertTo-Json
+        SendJson $Response $json
+    } catch {
+        $json = @{ users = @() } | ConvertTo-Json
+        SendJson $Response $json
+    }
+}
+
+# ==================== RESPONSE FUNCTIONS ====================
+function SendHtml {
+    param(
+        [System.Net.HttpListenerResponse]$Response,
+        [string]$Html,
+        [string]$SessionId
+    )
+    
+    try {
+        $buffer = [System.Text.Encoding]::UTF8.GetBytes($Html)
+        $Response.ContentType = "text/html; charset=utf-8"
+        $Response.ContentLength64 = $buffer.Length
+        
+        if (-not [string]::IsNullOrEmpty($SessionId)) {
+            $cookie = New-Object System.Net.Cookie("LAPS_SESSION", $SessionId)
+            $cookie.Path = "/"
+            $cookie.HttpOnly = $true
+            $cookie.Secure = $false
+            $Response.SetCookie($cookie)
+        }
+        
+        $Response.OutputStream.Write($buffer, 0, $buffer.Length)
+    } catch {
+        # Silent fail
+    }
+}
+
+function SendJson {
+    param(
+        [System.Net.HttpListenerResponse]$Response,
+        [string]$Json
+    )
+    
+    try {
+        $buffer = [System.Text.Encoding]::UTF8.GetBytes($Json)
+        $Response.ContentType = "application/json; charset=utf-8"
+        $Response.ContentLength64 = $buffer.Length
+        $Response.OutputStream.Write($buffer, 0, $buffer.Length)
+    } catch {
+        # Silent fail
+    }
+}
+
+# ==================== HTTP SERVER ====================
+Write-Host "Starting HTTP Server on $ListenIP`:$Port..." -ForegroundColor Cyan
+
+$listener = New-Object System.Net.HttpListener
+$listener.Prefixes.Add("http://$ListenIP`:$Port/")
 
 try {
-    Add-Type -TypeDefinition $CSharpCode -Language CSharp -ReferencedAssemblies "System.Web", "System", "System.Web.Extensions", "System.DirectoryServices" -ErrorAction Stop
-    Write-Host "[OK] C# server compiled successfully" -ForegroundColor Green
+    $listener.Start()
+    Write-Host "[OK] Server listening on http://$ListenIP`:$Port/" -ForegroundColor Green
 } catch {
-    Write-Host "[FAIL] Compilation failed: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "[FAIL] Cannot bind to $ListenIP`:$Port" -ForegroundColor Red
+    Write-Host "Error: $_" -ForegroundColor Red
     exit 1
 }
 
-# Create server instance
-$server = New-Object LapsWebServer("10.209.110.220", 8080, $LogPath, $UserDetailsPath, $PortalStatusPath)
-
-# Graceful shutdown handler
+# Graceful shutdown
 $null = Register-ObjectEvent -InputObject ([System.Console]) -EventName "CancelKeyPress" -Action {
     Write-Host "`n[SHUTDOWN] Stopping server..." -ForegroundColor Yellow
-    $server.Stop()
+    $listener.Stop()
+    $listener.Close()
     Start-Sleep -Seconds 1
     Write-Host "[SHUTDOWN] Server stopped successfully" -ForegroundColor Cyan
     exit 0
@@ -1382,7 +1269,7 @@ try {
     Write-Host "                LAPS Web Portal Server" -ForegroundColor Green
     Write-Host "========================================================" -ForegroundColor Cyan
     Write-Host "" -ForegroundColor Cyan
-    Write-Host "URL:                http://10.209.110.220:8080/" -ForegroundColor White
+    Write-Host "URL:                http://$ListenIP`:$Port/" -ForegroundColor White
     Write-Host "DNS:                $DNSName" -ForegroundColor White
     Write-Host "Admin Login:        ADMIN / ADMIN123" -ForegroundColor Yellow
     Write-Host "Activity Logs:      $LogPath" -ForegroundColor Cyan
@@ -1398,18 +1285,136 @@ try {
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     Add-Content -Path (Join-Path $PortalStatusPath "Portal_Status_$(Get-Date -Format 'yyyy-MM-dd').log") -Value "[$timestamp] [SERVER_START] Portal service started on $ServerUrl" -Encoding UTF8 -ErrorAction SilentlyContinue
     
-    # Start browser automatically
-    Write-Host "Opening portal in Chrome..." -ForegroundColor Cyan
+    # Open browser
+    Write-Host "Opening portal in browser..." -ForegroundColor Cyan
     Start-Process "chrome.exe" -ArgumentList "$ServerUrl" -ErrorAction SilentlyContinue
     
     Write-Host "Portal is live! Check your browser." -ForegroundColor Green
     Write-Host "=========================== LIVE ACTIVITY LOG ===========================" -ForegroundColor Yellow
     
-    $server.Start()
-    
+    # Main request loop
+    while ($listener.IsListening) {
+        try {
+            $context = $listener.GetContext()
+            
+            $req = $context.Request
+            $res = $context.Response
+            
+            $path = $req.Url.AbsolutePath.ToLower()
+            $method = $req.HttpMethod
+            $sessionId = GetSessionCookie $req
+            $clientIp = $req.RemoteEndPoint.Address.ToString()
+            
+            try {
+                if ($method -eq "GET" -and ($path -eq "/" -or $path -eq "/index.html")) {
+                    if ([string]::IsNullOrEmpty($sessionId) -or -not (IsSessionValid $sessionId)) {
+                        LogActivity "PAGE_ACCESS" "Anonymous" $clientIp "Accessed login page" "INFO"
+                        $html = BuildLoginPage $null
+                        SendHtml $res $html $null
+                    } else {
+                        $html = BuildMainPage $null $null $null (GetSessionUser $sessionId) (GetSessionUserName $sessionId) (IsSessionAdmin $sessionId)
+                        SendHtml $res $html $sessionId
+                    }
+                }
+                elseif ($method -eq "POST" -and $path -eq "/login") {
+                    HandleLogin $req $res $clientIp
+                }
+                elseif ($method -eq "GET" -and $path -eq "/logout-page") {
+                    $user = GetSessionUser $sessionId
+                    LogActivity "LOGOUT" $user $clientIp "User logged out" "SUCCESS"
+                    [System.Threading.Monitor]::Enter($Global:SessionLock)
+                    try {
+                        if (-not [string]::IsNullOrEmpty($sessionId) -and $Global:SessionData.ContainsKey($sessionId)) {
+                            $Global:SessionData.Remove($sessionId)
+                        }
+                    } finally {
+                        [System.Threading.Monitor]::Exit($Global:SessionLock)
+                    }
+                    $html = BuildLoginPage "Logged out successfully"
+                    SendHtml $res $html $null
+                }
+                elseif ($method -eq "POST" -and $path -eq "/get-laps") {
+                    if (-not (IsSessionValid $sessionId)) {
+                        $res.StatusCode = 401
+                        SendJson $res '{"error":"Unauthorized"}'
+                        $res.Close()
+                        continue
+                    }
+                    HandleLapsQuery $req $res $sessionId $clientIp
+                }
+                elseif ($method -eq "GET" -and $path -eq "/admin") {
+                    if (-not (IsSessionValid $sessionId) -or -not (IsSessionAdmin $sessionId)) {
+                        $res.StatusCode = 403
+                        $html = BuildLoginPage "Access denied"
+                        SendHtml $res $html $null
+                        $res.Close()
+                        continue
+                    }
+                    $html = BuildAdminPage $null (GetSessionUser $sessionId) (GetSessionUserName $sessionId)
+                    SendHtml $res $html $sessionId
+                }
+                elseif ($method -eq "POST" -and $path -eq "/admin/add-user") {
+                    if (-not (IsSessionValid $sessionId) -or -not (IsSessionAdmin $sessionId)) {
+                        $res.StatusCode = 403
+                        SendJson $res '{"error":"Unauthorized"}'
+                        $res.Close()
+                        continue
+                    }
+                    HandleAddUser $req $res $sessionId $clientIp
+                }
+                elseif ($method -eq "POST" -and $path -eq "/admin/remove-user") {
+                    if (-not (IsSessionValid $sessionId) -or -not (IsSessionAdmin $sessionId)) {
+                        $res.StatusCode = 403
+                        SendJson $res '{"error":"Unauthorized"}'
+                        $res.Close()
+                        continue
+                    }
+                    HandleRemoveUser $req $res $sessionId $clientIp
+                }
+                elseif ($method -eq "GET" -and $path -eq "/admin/get-users") {
+                    if (-not (IsSessionValid $sessionId) -or -not (IsSessionAdmin $sessionId)) {
+                        $res.StatusCode = 403
+                        SendJson $res '{"error":"Unauthorized"}'
+                        $res.Close()
+                        continue
+                    }
+                    HandleGetUsers $res
+                }
+                else {
+                    $res.StatusCode = 404
+                    $html = "<h1>404 Not Found</h1>"
+                    SendHtml $res $html $null
+                }
+            } catch {
+                try {
+                    $res.StatusCode = 500
+                    $errorHtml = "<h1>Server Error</h1><pre>$(SafeHtmlEncode $_)</pre>"
+                    SendHtml $res $errorHtml $null
+                } catch {
+                    # Silent fail
+                }
+            } finally {
+                try {
+                    $res.Close()
+                } catch {
+                    # Silent fail
+                }
+            }
+        } catch [System.Net.HttpListenerException] {
+            # Server stopped
+            break
+        } catch {
+            Write-Host "[REQUEST_ERROR] $_" -ForegroundColor Red
+        }
+    }
 } catch {
-    Write-Host "`n[FAIL] Server failed: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "`n[FAIL] Server failed: $_" -ForegroundColor Red
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    Add-Content -Path (Join-Path $PortalStatusPath "Portal_Status_$(Get-Date -Format 'yyyy-MM-dd').log") -Value "[$timestamp] [SERVER_ERROR] Server failed: $($_.Exception.Message)" -Encoding UTF8 -ErrorAction SilentlyContinue
+    Add-Content -Path (Join-Path $PortalStatusPath "Portal_Status_$(Get-Date -Format 'yyyy-MM-dd').log") -Value "[$timestamp] [SERVER_ERROR] Server failed: $_" -Encoding UTF8 -ErrorAction SilentlyContinue
     exit 1
+} finally {
+    if ($listener) {
+        $listener.Stop()
+        $listener.Close()
+    }
 }
