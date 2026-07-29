@@ -1,0 +1,111 @@
+# Create Initial Session State to share functions/variables with background threads
+    $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    Get-Command -CommandType Function | ForEach-Object {
+        $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($_.Name, $_.ScriptBlock.ToString()))
+    }
+    $iss.ImportPSModule("LAPS")
+    
+    # Share global state variables with all threads
+    $globalVars = @("SessionData", "AuthorizedUsers", "LoginAttempts", "SessionLock", "LoginLock", "LogLock", "PortalStatusPath", "LogPath")
+    foreach ($var in $globalVars) {
+        $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new($var, (Get-Variable "Global:$var").Value, ""))
+    }
+    
+    # Create a pool of up to 15 concurrent threads
+    $RunspacePool = [runspacefactory]::CreateRunspacePool(1, 15, $iss, $Host)
+    $RunspacePool.Open()
+    $ActiveJobs = @()
+
+    # Main concurrent request loop
+    while ($listener.IsListening) {
+        try {
+            $context = $listener.GetContext()
+            
+            $ps = [powershell]::Create().AddScript({
+                param($context)
+                
+                # Remap globals for the thread
+                $Global:SessionData = $SessionData; $Global:AuthorizedUsers = $AuthorizedUsers; $Global:LoginAttempts = $LoginAttempts
+                $Global:SessionLock = $SessionLock; $Global:LoginLock = $LoginLock; $Global:LogLock = $LogLock
+                $Global:PortalStatusPath = $PortalStatusPath; $Global:LogPath = $LogPath
+                
+                $req = $context.Request
+                $res = $context.Response
+                $path = $req.Url.AbsolutePath.ToLower()
+                $method = $req.HttpMethod
+                $sessionId = GetSessionCookie $req
+                $clientIp = $req.RemoteEndPoint.Address.ToString()
+                
+                try {
+                    if ($method -eq "GET" -and ($path -eq "/" -or $path -eq "/index.html")) {
+                        if ([string]::IsNullOrEmpty($sessionId) -or -not (IsSessionValid $sessionId)) {
+                            LogActivity "PAGE_ACCESS" "Anonymous" $clientIp "Accessed login page" "INFO"
+                            $html = BuildLoginPage $null
+                            SendHtml $res $html $null
+                        } else {
+                            $html = BuildMainPage $null $null $null (GetSessionUser $sessionId) (GetSessionUserName $sessionId) (IsSessionAdmin $sessionId)
+                            SendHtml $res $html $sessionId
+                        }
+                    }
+                    elseif ($method -eq "POST" -and $path -eq "/login") { HandleLogin $req $res $clientIp }
+                    elseif ($method -eq "GET" -and $path -eq "/logout-page") {
+                        $user = GetSessionUser $sessionId
+                        LogActivity "LOGOUT" $user $clientIp "User logged out" "SUCCESS"
+                        [System.Threading.Monitor]::Enter($Global:SessionLock)
+                        try { if (-not [string]::IsNullOrEmpty($sessionId) -and $Global:SessionData.ContainsKey($sessionId)) { $Global:SessionData.Remove($sessionId) } } 
+                        finally { [System.Threading.Monitor]::Exit($Global:SessionLock) }
+                        $html = BuildLoginPage "Logged out successfully"
+                        SendHtml $res $html $null
+                    }
+                    elseif ($method -eq "POST" -and $path -eq "/get-laps") {
+                        if (-not (IsSessionValid $sessionId)) { $res.StatusCode = 401; SendJson $res '{"error":"Unauthorized"}'; return }
+                        HandleLapsQuery $req $res $sessionId $clientIp
+                    }
+                    elseif ($method -eq "GET" -and $path -eq "/admin") {
+                        if (-not (IsSessionValid $sessionId) -or -not (IsSessionAdmin $sessionId)) { $res.StatusCode = 403; SendHtml $res (BuildLoginPage "Access denied") $null; return }
+                        SendHtml $res (BuildAdminPage $null (GetSessionUser $sessionId) (GetSessionUserName $sessionId)) $sessionId
+                    }
+                    elseif ($method -eq "POST" -and $path -eq "/admin/add-user") {
+                        if (-not (IsSessionValid $sessionId) -or -not (IsSessionAdmin $sessionId)) { $res.StatusCode = 403; SendJson $res '{"error":"Unauthorized"}'; return }
+                        HandleAddUser $req $res $sessionId $clientIp
+                    }
+                    elseif ($method -eq "POST" -and $path -eq "/admin/edit-user") {
+                        if (-not (IsSessionValid $sessionId) -or -not (IsSessionAdmin $sessionId)) { $res.StatusCode = 403; SendJson $res '{"error":"Unauthorized"}'; return }
+                        HandleEditUser $req $res $sessionId $clientIp
+                    }
+                    elseif ($method -eq "POST" -and $path -eq "/admin/remove-user") {
+                        if (-not (IsSessionValid $sessionId) -or -not (IsSessionAdmin $sessionId)) { $res.StatusCode = 403; SendJson $res '{"error":"Unauthorized"}'; return }
+                        HandleRemoveUser $req $res $sessionId $clientIp
+                    }
+                    elseif ($method -eq "GET" -and $path -eq "/admin/get-users") {
+                        if (-not (IsSessionValid $sessionId) -or -not (IsSessionAdmin $sessionId)) { $res.StatusCode = 403; SendJson $res '{"error":"Unauthorized"}'; return }
+                        HandleGetUsers $res
+                    }
+                    else { $res.StatusCode = 404; SendHtml $res "<h1>404 Not Found</h1>" $null }
+                } catch {
+                    try { $res.StatusCode = 500; SendHtml $res "<h1>Server Error</h1><pre>$(SafeHtmlEncode $_)</pre>" $null } catch {}
+                } finally {
+                    try { $res.Close() } catch {}
+                }
+            }).AddArgument($context)
+            
+            $ps.RunspacePool = $RunspacePool
+            $asyncResult = $ps.BeginInvoke()
+            
+            # Clean up finished jobs to free memory
+            $ActiveJobs += [PSCustomObject]@{ PS = $ps; Result = $asyncResult }
+            $ActiveJobs = $ActiveJobs | Where-Object { 
+                if ($_.Result.IsCompleted) {
+                    $_.PS.EndInvoke($_.Result)
+                    $_.PS.Dispose()
+                    return $false
+                }
+                return $true
+            }
+            
+        } catch [System.Net.HttpListenerException] {
+            break # Server stopped
+        } catch {
+            Write-Host "[REQUEST_ERROR] $_" -ForegroundColor Red
+        }
+    }
