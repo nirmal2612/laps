@@ -54,8 +54,22 @@ try {
     # a real scriptblock and invoking it with the launcher's own $args
     # forwarded (@args) makes parameter binding work exactly like running
     # the .ps1 file directly with -RunServer.
+    #
+    # IMPORTANT #2: this MUST be dot-sourced ( . $sb ), not called ( & $sb ).
+    # The call operator (&) runs the scriptblock in a new CHILD scope, so
+    # every function defined inside it (Write-LiveLog, Start-Portal, etc.)
+    # only exists in that nested scope. That breaks Register-ObjectEvent's
+    # -Action blocks used for streaming the server's output into the Live
+    # Activity Log: those blocks execute later, in a separate event-
+    # subscriber pipeline that only has access to true GLOBAL scope, not
+    # the caller's lexical scope. If Write-LiveLog isn't global, those
+    # -Action blocks fail silently and the Live Activity Log stops
+    # updating after the first couple of lines. Dot-sourcing merges the
+    # scriptblock's scope into the caller's scope (global, here), which
+    # keeps parameter binding with @args working exactly the same while
+    # fixing the log streaming.
     `$sb = [ScriptBlock]::Create(`$script)
-    & `$sb @args
+    . `$sb @args
 
 } catch {
     [System.Windows.MessageBox]::Show("Error: `$_", "PC Audit Tool", "OK", "Error")
