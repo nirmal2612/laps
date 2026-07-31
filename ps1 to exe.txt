@@ -1,0 +1,13 @@
+Import-Module .\ps2exe.psd1
+ 
+Invoke-ps2exe `
+  -InputFile "C:\Users\HH0010520\Desktop\LAPS\LAPS_Host_Manager.ps1" `
+  -OutputFile "C:\Users\HH0010520\Desktop\LAPS\LAPS_Host_Manager.exe" `
+  -IconFile "C:\Users\HH0010520\Desktop\LAPS\lock.ico" `
+  -Product "LAPS_Host_Manager" `
+  -Version "1.0.0.0" `
+  -Description "LAPS_Web_Portal_Host_Manager" `
+  -Company "FOXCONN-IT" `
+  -Copyright "HH0010520" `
+  -Title "LAPS_Web_Portal_Host_Manager" `
+  -noConsole
