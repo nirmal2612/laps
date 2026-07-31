@@ -1,0 +1,38 @@
+# 3. Create launcher script with EMBEDDED encrypted data
+$launcher = @"
+param([switch]`$RunServer)
+
+`$encryptedData = '$base64'
+`$password = '$password'
+
+try {
+    `$payload = [System.Convert]::FromBase64String(`$encryptedData)
+    `$salt = `$payload[0..15]
+    `$iv = `$payload[16..31]
+    `$cipher = `$payload[32..(`$payload.Length-1)]
+    
+    `$kdf = New-Object System.Security.Cryptography.Rfc2898DeriveBytes(`$password, `$salt, 10000)
+    `$key = `$kdf.GetBytes(32)
+    
+    `$aes = [System.Security.Cryptography.Aes]::Create()
+    `$aes.Key = `$key
+    `$aes.IV = `$iv
+    `$decryptor = `$aes.CreateDecryptor()
+    `$decrypted = `$decryptor.TransformFinalBlock(`$cipher, 0, `$cipher.Length)
+    `$scriptText = [System.Text.Encoding]::UTF8.GetString(`$decrypted)
+    
+    # Convert the decrypted string into a runnable ScriptBlock
+    `$scriptBlock = [scriptblock]::Create(`$scriptText)
+    
+    # Execute the ScriptBlock and pass the -RunServer argument down if it exists
+    if (`$RunServer) {
+        & `$scriptBlock -RunServer
+    } else {
+        & `$scriptBlock
+    }
+    
+} catch {
+    Add-Type -AssemblyName System.Windows.Forms
+    [System.Windows.Forms.MessageBox]::Show("Error: `$_", "LAPS Host Manager", "OK", "Error")
+}
+"@
